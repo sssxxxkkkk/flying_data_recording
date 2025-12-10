@@ -26,25 +26,27 @@ int main(int argc, char *argv[])
 
 	if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help"))
 	{
-		std::cout << "Usage: " << argv[0] << " [output_file_path]" << std::endl;
-		std::cout << "Default output file path: ./\n Default output file name: default_file_name" << std::endl
-				  << std::endl;
+		std::cout << "Usage: " << argv[0] << " [dest_ip]" << std::endl;
+        std::cout << "Usage: " << argv[1] << " [dest_port]" << std::endl;
 		std::cout << long_program_desc << std::endl;
 		return 0;
 	}
 
 	std::string out_file_path = "./save_data";
-	if (argc == 3 && std::string(argv[1]) != "-h" && std::string(argv[1]) != "--help")
+    std::string dest_ip = "192.168.247.31";
+    int dest_port = 5000;
+    if (argc >= 2 && std::string(argv[1]) != "-h" && std::string(argv[1]) != "--help")
 	{
-		out_file_path = argv[1];
+	   dest_ip = std::string(argv[1]);
 	}
-	else
-	{
-		std::cout << "The current file path is not entered, "
-				  << "If you need to set the file path,"
-				  << "use the input parameters to set it." << std::endl
-				  << std::endl;
-	}
+    
+    if (argc >= 3) {
+        try {
+            dest_port = std::stoi(argv[2]);
+        } catch (const std::exception& e) {
+            std::cerr << "Invalid port number: " << argv[2] << ". Using default port " << dest_port << std::endl;
+        }
+    }
 
 	std::cout << long_program_desc << std::endl;
 
@@ -54,9 +56,7 @@ int main(int argc, char *argv[])
 	bool stop_application = false;
 	dvsense::DsStatisticInfo statistic_info;
   
-  //远程服务器的ip
-  std::string dest_ip = "192.168.247.31";
-  int dest_port = 5000;
+    //远程服务器的ip
 	DvsenseRecorder recorder(out_file_path,dest_ip,dest_port);
  
 	dvsense::Calibrator calibrator;
@@ -90,18 +90,14 @@ int main(int argc, char *argv[])
 				std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 				continue;
 			}
-			//std::vector<dvsense::ToolInfo> tools_info = camera->getAllToolsInfo();
+
 			// Open the first camera found
 			camera = cameraManager.openFusionCamera(open_camera_serial);
+
+			// 设置事件触发阈值
 			std::shared_ptr<dvsense::CameraTool> bias = camera->getTool(dvsense::ToolType::TOOL_BIAS);
-			int val;
-			bool ret = bias->getParam("bias_diff_on", val);
-			//std::cout << ret << std::endl;
-			
-			// const std::map<std::string, dvsense::BasicParameterInfo> param_info = bias->getAllParamInfo();
-			// int value;
-			// bool ret = bias->getParam("bias_diff_on", 50);
-			// bool ret = bias->setParam("bias_diff_off", 10);
+			bool ret = bias->setParam("bias_diff_on", 50);
+			ret = bias->setParam("bias_diff_off", 50);
 
 			dvsense::CalibratorParameters cali_param;
 			if(camera->readCalibrationParam(cali_param))
@@ -125,9 +121,9 @@ int main(int argc, char *argv[])
 		}
 
 	
-    // 仅记录事件，通过相机的触发信号来同步
-    camera->startRecording(out_file_path, "events", dvsense::DVS_STREAM);
-               //camera->startRecording(out_file_path, "events");
+        // 仅记录事件，通过相机的触发信号来同步
+		camera->startRecording(recorder.file_path_events_, "events", dvsense::DVS_STREAM);
+	    //camera->startRecording(out_file_path, "events");
 
 		std::string input_command;
 		std::getline(std::cin, input_command);

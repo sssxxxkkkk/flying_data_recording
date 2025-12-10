@@ -62,3 +62,12 @@ target_include_directories(dvsense_recorder
         ${CURL_INCLUDE_DIRS}
         ./
 )
+
+add_custom_target(copy_executable
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:dvsense_recorder>
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../launch/
+    DEPENDS dvsense_recorder
+)
+
+add_custom_target(default ALL DEPENDS dvsense_recorder copy_executable)

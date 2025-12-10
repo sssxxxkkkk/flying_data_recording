@@ -70,6 +70,12 @@ public:
                      {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_});
     
         // 4. 添加发送数据的代码
+        struct timeval timeout;
+        timeout.tv_sec = 0.3;
+        timeout.tv_usec = 0;
+        setsockopt(sockfd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
+        // 4. 添加发送数据的代码
         int bytes_sent = sendto(sockfd_, buffer_.data(), buffer_.size(), 0, 
                               (struct sockaddr*)&servaddr_, sizeof(servaddr_));
         
@@ -246,19 +252,26 @@ public:
     double delta_t = 0;      // 相机时间 + delta_t = 系统时间
     std::string file_path_;
     std::string file_path_images_;
+    std::string file_path_events_;
     std::string sync_filename_;
     
     DvsenseRecorder(std::string file_path, std::string& dest_ip, int dest_port ): dest_ip(dest_ip), dest_port(dest_port), 
       v_sender(dest_ip, dest_port)
     {
         file_path_ = file_path;
-        file_path_images_ = file_path + "/image";
-        sync_filename_ = file_path_ + "/sync_signal.txt";
+        file_path_images_ = file_path + "/image_data";
+        file_path_events_ = file_path + "/event_data";
+        sync_filename_ = file_path_events_ + "/sync_signal.txt";
 
         //1. 如果文件夹不存在，则创建
         if (!std::filesystem::exists(file_path_))
         {
             std::filesystem::create_directory(file_path_);
+        }
+
+        if (!std::filesystem::exists(file_path_events_))
+        {
+            std::filesystem::create_directory(file_path_events_);
         }
 
         if (!std::filesystem::exists(file_path_images_))
