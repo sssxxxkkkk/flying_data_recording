@@ -141,16 +141,16 @@ int main(int argc, char **argv)
                 //     printf("accel.x: %f, accel.y: %f, accel.z: %f\n", 
 			    // g_output_info.accel.x , g_output_info.accel.y , g_output_info.accel.z );
                 
-                fprintf(fp,"%d, %.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%ld.%09ld\n",
+                fprintf(fp,"%d,%ld,%09ld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,\n",
                     num,
+                    g_output_info.ts.tv_sec, 
+                    g_output_info.ts.tv_nsec,
                     g_output_info.angle_rate.x,
                     g_output_info.angle_rate.y,
                     g_output_info.angle_rate.z,
                     g_output_info.accel.x,
                     g_output_info.accel.y,
-                    g_output_info.accel.z,
-                    g_output_info.ts.tv_sec, 
-                    g_output_info.ts.tv_nsec
+                    g_output_info.accel.z          
                 );
             }
 	    }

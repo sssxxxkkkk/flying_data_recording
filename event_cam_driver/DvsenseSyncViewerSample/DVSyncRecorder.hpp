@@ -166,20 +166,25 @@ private:
                     
                     // 保存图像到文件
                     uint64_t adjusted_timestamp = frame.exposure_start_timestamp + (uint64_t)delta_t;
-                    std::string image_filename = file_path_images_ + "/" + std::to_string(adjusted_timestamp) + ".png";
+                    std::string image_filename = file_path_images_ + "/" + std::to_string(adjusted_timestamp) + ".bmp";
                     
                     cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
-                    cv::Mat corrected_image;
-
+                    cv::Mat image_bgr;
+    
                     if (is_calibrated_) {
-                        cv::remap(image, corrected_image, map_x_, map_y_, cv::INTER_LINEAR);
-                        cv::imwrite(image_filename, corrected_image);
+                        cv::Mat image_rgb;
+                        cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
+                        cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
+                        cv::imwrite(image_filename, image_bgr);
+                        v_sender.sendFrame(image_bgr);  
                     } else {
-                        cv::imwrite(image_filename, image);
+                        cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
+                        cv::imwrite(image_filename, image_bgr);
+                        v_sender.sendFrame(image);  
                     }
 
                     lock.lock();
-                }
+                    }
 
                 // 关闭同步信号文件流
                 if (sync_file_stream_.is_open()) {
@@ -227,17 +232,20 @@ private:
                 
                 // 保存图像到文件
                 uint64_t adjusted_timestamp = frame.exposure_start_timestamp + (uint64_t)delta_t;
-                std::string image_filename = file_path_images_ + "/" + std::to_string(adjusted_timestamp) + ".png";
+                std::string image_filename = file_path_images_ + "/" + std::to_string(adjusted_timestamp) + ".bmp";
                 
                 cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
-                cv::Mat corrected_image;
+                cv::Mat image_bgr;
 
                 if (is_calibrated_) {
-                    cv::remap(image, corrected_image, map_x_, map_y_, cv::INTER_LINEAR);
-                    cv::imwrite(image_filename, corrected_image);
-                    v_sender.sendFrame(corrected_image);  
+                    cv::Mat image_rgb;
+                    cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
+                    cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
+                    cv::imwrite(image_filename, image_bgr);
+                    v_sender.sendFrame(image_bgr);  
                 } else {
-                    cv::imwrite(image_filename, image);
+                    cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
+                    cv::imwrite(image_filename, image_bgr);
                     v_sender.sendFrame(image);  
                 }
                                               

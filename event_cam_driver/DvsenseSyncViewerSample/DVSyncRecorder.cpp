@@ -32,8 +32,8 @@ int main(int argc, char *argv[])
 		return 0;
 	}
 
-	std::string out_file_path = "./save_data";
-    std::string dest_ip = "192.168.247.31";
+	std::string out_file_path = "../save_data";
+    std::string dest_ip = "192.168.10.1";
     int dest_port = 5000;
     if (argc >= 2 && std::string(argv[1]) != "-h" && std::string(argv[1]) != "--help")
 	{
@@ -41,11 +41,11 @@ int main(int argc, char *argv[])
 	}
     
     if (argc >= 3) {
-        try {
-            dest_port = std::stoi(argv[2]);
-        } catch (const std::exception& e) {
-            std::cerr << "Invalid port number: " << argv[2] << ". Using default port " << dest_port << std::endl;
-        }
+	try {
+	    dest_port = std::stoi(argv[2]);
+	} catch (const std::exception& e) {
+	    std::cerr << "Invalid port number: " << argv[2] << ". Using default port " << dest_port << std::endl;
+	}
     }
 
 	std::cout << long_program_desc << std::endl;
@@ -121,9 +121,9 @@ int main(int argc, char *argv[])
 		}
 
 	
-        // 仅记录事件，通过相机的触发信号来同步
+                // 仅记录事件，通过相机的触发信号来同步
 		camera->startRecording(recorder.file_path_events_, "events", dvsense::DVS_STREAM);
-	    //camera->startRecording(out_file_path, "events");
+	        //camera->startRecording(recorder.file_path_events_, "events");
 
 		std::string input_command;
 		std::getline(std::cin, input_command);
