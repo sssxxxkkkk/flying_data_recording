@@ -1,11 +1,32 @@
 #include <opencv2/opencv.hpp>
-#include "DvsenseDriver/FileReader/ApsFileReader.h"
 #include "DvsenseDriver/camera/FusionCamera.hpp"
 #include "DvsenseDriver/FileReader/DvsFileReader.h"
 #include <condition_variable>
-#include <thread>
-#include "DvsenseDriver/Calibration/Calibrator.hpp"
 #include"DvsenseBase/Utils/Json/JsonUtils.hpp"
+#include <thread>
+#include <filesystem> // C++17
+#include <regex>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <iostream>
+
+using namespace std;
+
+// Helper: check if string is all digits (for timestamp filename)
+bool isAllDigits(const std::string& s) {
+    if (s.empty()) return false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
 class SyncDisplayer
 {
 public:
@@ -37,8 +58,8 @@ public:
 	int dvs_height_ = 720;
 	int dvs_width_ = 1280;
 
-	int aps_height_ = 2160;
-	int aps_width_ = 3840;
+	int aps_height_ = 720;
+	int aps_width_ = 1280;
 
 	// Gray
 	cv::Vec3b color_bg_ = cv::Vec3b(0xff, 0xff, 0xff);
@@ -186,107 +207,123 @@ public:
 		}
 	}
 };
+
 int main(int argc, char *argv[])
 {
+    const std::string short_program_desc("Simple viewer to stream events and BMP images from folder.\n");
+    std::string long_program_desc(short_program_desc + "Press 'q' or Escape key to leave the program.\n");
+    std::cout << long_program_desc << std::endl;
 
-	// ----------------- Program description -----------------
+    // ----------------- 配置路径 -----------------
+    std::string image_folder = "../save_data/image_data";
+    std::string dvs_file_path = "../save_data/event_data/events.raw";
 
-	// if (argc < 2) {
-	//	std::cerr << "Usage: " << argv[0] << " <aps_file_path>" << std::endl;
-	//	return 1;
-	// }
+    // ----------------- 使用 OpenCV glob 获取所有 .bmp 文件 -----------------
+    std::vector<cv::String> bmp_files;
+    cv::glob(image_folder + "/*.bmp", bmp_files, false); // false = non-recursive
 
-	const std::string short_program_desc(
-		"Simple viewer to stream events from an event file, using the SDK driver API.\n");
-	std::string long_program_desc(short_program_desc +
-								  "Press 'q' or Escape key to leave the program.\n");
-	std::cout << long_program_desc << std::endl;
+    if (bmp_files.empty()) {
+        std::cerr << "No .bmp files found in: " << image_folder << std::endl;
+        return -1;
+    }
 
-	// ----------------- Event file initialization -----------------
+    // 转为 (timestamp, filepath) 并过滤非数字文件名
+    std::vector<std::pair<uint64_t, std::string>> timestamped_images;
+    for (const auto& filepath : bmp_files) {
+        // 提取文件名（不含路径和扩展名）
+        size_t last_slash = filepath.find_last_of("/\\");
+        std::string filename = (last_slash == std::string::npos) ? filepath : filepath.substr(last_slash + 1);
+        
+        if (filename.size() > 4 && filename.substr(filename.size() - 4) == ".bmp") {
+            std::string stem = filename.substr(0, filename.size() - 4);
+            if (isAllDigits(stem)) {
+                uint64_t ts = std::stoull(stem);
+                timestamped_images.push_back(std::make_pair(ts, filepath));
+            }
+        }
+    }
 
-	std::string aps_file_path;
-	std::string perfix_path = "C:/DVSense/dvsensehal/build/bin/Release"; 
-	// aps_file_path = argv[1];
-	aps_file_path = perfix_path + "\\default_file_name.mp4";
-	std::cout << "Aps file path: " << aps_file_path << std::endl;
+    if (timestamped_images.empty()) {
+        std::cerr << "No valid timestamp-named .bmp files found." << std::endl;
+        return -1;
+    }
 
-	std::string dvs_file_path;
-	dvs_file_path = perfix_path + "/default_file_name.raw";
+    // 按时间戳排序
+    std::sort(timestamped_images.begin(), timestamped_images.end(),
+        [](const std::pair<uint64_t, std::string>& a,
+           const std::pair<uint64_t, std::string>& b) {
+            return a.first < b.first;
+        });
 
-	std::string calibration_file_path = perfix_path + "/default_file_name.json";
-	dvsense::CalibratorParameters calibration_param;
-	if(!dvsense::jsonFileToParam(calibration_file_path, calibration_param))
-	{
-		return -1;
-	}
-	dvsense::Calibrator calibrator;
-	calibrator.loadCalibrationParam(calibration_param);
-	std::shared_ptr<dvsense::ApsFileReader> aps_reader = dvsense::ApsFileReader::createFileReader(aps_file_path);
-	aps_reader->loadFile();
+    std::cout << "Found " << timestamped_images.size() << " valid BMP images." << std::endl;
 
-	std::shared_ptr<dvsense::DvsFileReader> dvs_reader = dvsense::DvsFileReader::createFileReader(dvs_file_path);
-	dvs_reader->loadFile();
+    // ----------------- 初始化 DVS 事件读取器 -----------------
+    std::shared_ptr<dvsense::DvsFileReader> dvs_reader = dvsense::DvsFileReader::createFileReader(dvs_file_path);
+    if (!dvs_reader->loadFile()) {
+        std::cerr << "Failed to load DVS file: " << dvs_file_path << std::endl;
+        return -1;
+    }
 
-	dvsense::TimeStamp start_timestamp, end_timestamp;
-	dvs_reader->getStartTimeStamp(start_timestamp);
-	dvs_reader->getEndTimeStamp(end_timestamp);
-	dvsense::TimeStamp get_time = start_timestamp;
-	dvsense::DvsFileInfo file_info;
-	dvs_reader->getFileInfo(file_info);
-	LOG_INFO("aps start ts: %llu", file_info.aps_start_timestamp);
-	std::mutex disp_mutex;
-	std::condition_variable disp_cond_;
+    dvsense::TimeStamp start_ts, end_ts;
+    dvs_reader->getStartTimeStamp(start_ts);
+    dvs_reader->getEndTimeStamp(end_ts);
+    std::cout << "DVS time range: " << start_ts << " ~ " << end_ts << std::endl;
 
-	const std::string window_name = "DVSense APS File Viewer";
-	cv::namedWindow(window_name, cv::WINDOW_GUI_NORMAL);
+    // ----------------- 显示设置 -----------------
+    const std::string window_name = "APS + DVS Fusion Viewer";
+    cv::namedWindow(window_name, cv::WINDOW_GUI_NORMAL);
 
-	cv::Mat aps_display;
-	const int fps = 30;													  // event-based cameras do not have a frame rate, but we need one for visualization
-	const int wait_time = static_cast<int>(std::round(1.f / fps * 1000)); // how long we should wait between two frames
-	bool palying = true;
-	SyncDisplayer sync_displayer(720, 1280);
-	std::thread get_frame_thread = std::thread([&]()
-											   {
-			while (palying)
-			{
-				dvsense::ApsFrame aps_frame;
-				
-				if(aps_reader->getNextFrame(aps_frame))
-				{
-					std::unique_lock<std::mutex> lock(disp_mutex);
-					dvsense::TimeStamp aps_dvs_ts = aps_frame.exposure_end_timestamp + file_info.aps_start_timestamp;
-					std::shared_ptr<dvsense::Event2DVector> dvs_events = dvs_reader->getNTimeEventsGivenStartTimeStamp(aps_dvs_ts - 10000, 10000);
-					LOG_INFO("timestamp: %llu, dvs ts: %llu", aps_frame.exposure_end_timestamp, aps_dvs_ts);
-					dvsense::ApsFrame aps_to_dvs_frame = calibrator.mapApsToDvs(aps_frame);
-					sync_displayer.processApsFrame(aps_to_dvs_frame); 
-					sync_displayer.fusionDvsToAps(dvs_events->data(), dvs_events->data() + dvs_events->size()); 
-					disp_cond_.notify_one();
-				}else
-				{
-					disp_cond_.notify_one();
-					palying = false;
-				}				
-				std::this_thread::sleep_for(std::chrono::milliseconds(500));
-			}
-			disp_cond_.notify_one();
-			palying = false; });
-	while (palying)
-	{
-		{
-			std::unique_lock<std::mutex> lock(disp_mutex);
-			disp_cond_.wait(lock);
-			sync_displayer.getFusionImage(aps_display);
-		}
+    const int fps = 30;
+    const int wait_time_ms = static_cast<int>(1000.0f / fps);
 
-		if (!aps_display.empty())
-		{
-			cv::imshow(window_name, aps_display);
-		}
+    SyncDisplayer sync_displayer(720, 1280); // DVS 分辨率
 
-		cv::waitKey(1);
-	}
-	// ----------------- Event processing and show -----------------
-	get_frame_thread.join();
-	cv::destroyAllWindows();
-	return 0;
+    // ----------------- 主播放循环 -----------------
+    for (const auto& item : timestamped_images) {
+        uint64_t ts = item.first;
+        const std::string& img_path = item.second;
+
+        // 1. 读取 BMP 图像
+        cv::Mat aps_image = cv::imread(img_path, cv::IMREAD_COLOR);
+        if (aps_image.empty()) {
+            std::cerr << "Warning: Failed to read image: " << img_path << std::endl;
+            continue;
+        }
+
+        // 2. 获取该时间戳附近的事件（±10ms）
+        dvsense::TimeStamp event_start = ts - 10000; // 10ms = 10,000 μs
+        dvsense::TimeStamp event_end = ts + 10000;
+        auto dvs_events = dvs_reader->getNTimeEventsGivenStartTimeStamp(event_start, event_end - event_start);
+
+        // 3. 将 APS 图像缩放到 DVS 分辨率（1280x720）
+        cv::Mat aps_resized;
+        cv::resize(aps_image, aps_resized, cv::Size(1280, 720), 0, 0, cv::INTER_LINEAR);
+
+        // 4. 复制到 SyncDisplayer
+        {
+            std::unique_lock<std::mutex> lock(sync_displayer.fusion_image_dvs_size_mutex_);
+            aps_resized.copyTo(sync_displayer.fusion_image_dvs_size_);
+        }
+
+        // 5. 叠加事件
+        if (dvs_events && !dvs_events->empty()) {
+            sync_displayer.fusionDvsToAps(dvs_events->data(), dvs_events->data() + dvs_events->size());
+        }
+
+        // 6. 显示
+        cv::Mat display;
+        sync_displayer.getFusionImage(display);
+        if (!display.empty()) {
+            cv::imshow(window_name, display);
+        }
+
+        // 7. 控制播放速度 & 退出
+        int key = cv::waitKey(wait_time_ms);
+        if (key == 'q' || key == 27) { // ESC
+            break;
+        }
+    }
+
+    cv::destroyAllWindows();
+    return 0;
 }

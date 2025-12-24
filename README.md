@@ -58,11 +58,15 @@ sh ./launch/launch_all.sh
 ```
 ./launch/dvsense_file_reader your_file_name.raw （请替换 your_file_name.raw 为实际文件名）
 ```
+- **回放event+image数据(default path ./save_data)**  
+```
+./launch/dvsense_fusion_reader
+```
 - **已保存数据目录**  
 ```
-事件数据：./saved_data/event_data
-图像数据：./saved_data/image_data
-红外数据：./saved_data/infrared_data
-惯性数据：./saved_data/inertial_data
-无人机数据：./saved_data/drone_data
+事件数据：./save_data/event_data
+图像数据：./save_data/image_data
+红外数据：./save_data/infrared_data
+惯性数据：./save_data/inertial_data
+无人机数据：./save_data/drone_data
 ```

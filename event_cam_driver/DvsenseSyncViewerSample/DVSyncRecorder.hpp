@@ -119,7 +119,7 @@ private:
     cv::Mat map_x_, map_y_;
     
     //初始化远程发送服务
-    std::string dest_ip = "192.168.247.31";
+    std::string dest_ip = "192.168.10.1";
     int dest_port = 5000;
     VideoSender v_sender;
     
@@ -147,7 +147,7 @@ private:
                         uint64_t cam_timestamp = trigger_in.timestamp;
                         auto system_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-                        double delta_t = (double)(system_time - cam_timestamp);
+                        delta_t = (double)(system_time - cam_timestamp);
                         
                         // 写入同步信号信息：相机时间戳 系统时间戳 差值
                         sync_file_stream_ << cam_timestamp << " " << system_time << " " << delta_t << std::endl;
@@ -165,8 +165,8 @@ private:
                     lock.unlock();
                     
                     // 保存图像到文件
-                    uint64_t adjusted_timestamp = frame.exposure_start_timestamp + (uint64_t)delta_t;
-                    std::string image_filename = file_path_images_ + "/" + std::to_string(adjusted_timestamp) + ".bmp";
+                    uint64_t exposure_timestamp = frame.exposure_start_timestamp;
+                    std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
                     
                     cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
                     cv::Mat image_bgr;
@@ -210,7 +210,7 @@ private:
                     uint64_t cam_timestamp = trigger_in.timestamp;
                     auto system_time = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-                    double delta_t = (double)(system_time - cam_timestamp);
+                    delta_t = (double)(system_time - cam_timestamp);
                     
                     // 写入同步信号信息：相机时间戳 系统时间戳 差值
                     sync_file_stream_ << cam_timestamp << " " << system_time << " " << delta_t << std::endl;
@@ -231,8 +231,8 @@ private:
                 lock.unlock();
                 
                 // 保存图像到文件
-                uint64_t adjusted_timestamp = frame.exposure_start_timestamp + (uint64_t)delta_t;
-                std::string image_filename = file_path_images_ + "/" + std::to_string(adjusted_timestamp) + ".bmp";
+                uint64_t exposure_timestamp = frame.exposure_start_timestamp;
+                std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
                 
                 cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
                 cv::Mat image_bgr;
