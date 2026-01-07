@@ -30,15 +30,18 @@ char SENSOR_DATA_PATH[256] = "/home/orangepi/wendy/AirCraftEyeV6.1/yesense_decod
 /*----------------------------------------------------------------------*/
 int main(int argc, char **argv)
 {
+    printf("使用方法: %s <文件路径>\n", argv[0]);
     // 检查是否有参数传入
-    if (argc < 2) {
-        printf("使用方法: %s <文件路径>\n", argv[0]);
-        return 1;
+    char path[1000] = "../save_data"
+    if (argc > 2) {   
+        // argv[1] 就是第一个参数（路径）
+        
+        strcp(path, argv[1]);
+	path = argv[1];
+	printf("传入的路径: %s\n", path);
     }
     
-    // argv[1] 就是第一个参数（路径）
-    char *path = argv[1];
-    printf("传入的路径: %s\n", path);
+
 
     int fd;
     int nread;
@@ -52,7 +55,7 @@ int main(int argc, char **argv)
     int num=0;
 
     speed_t speed = B460800;
-    dev = "/dev/ttyACM0";	
+    dev = "/dev/ttyAMA0";	
     fd = open(dev, O_RDWR | O_NONBLOCK| O_NOCTTY | O_NDELAY); 
     if (fd < 0)	{
         printf("Can't Open Serial Port!\n");
@@ -85,9 +88,10 @@ int main(int argc, char **argv)
         perror("Failed to open test.csv");
         pthread_exit(NULL);
     }
+    
     // CSV表头 - 使用逗号分隔
-    fprintf(fp, "Num,angle_rate.x,angle_rate.y,angle_rate.z,");
-    fprintf(fp, "accel.x,accel.y,accel.z,time_stamp\n");
+    fprintf(fp, "num, time_stample_sec, time_stample_nsec, angle_rate.x, angle_rate.y, angle_rate.z,");
+    fprintf(fp, "accel.x, accel.y, accel.z, quaternion0, quaternion1, quaternion2, quaternion3\n");
 
     fflush(fp);
 
@@ -134,14 +138,7 @@ int main(int argc, char **argv)
                 // 获取系统实时时间（最精确）
                 clock_gettime(CLOCK_REALTIME, &g_output_info.ts);
 
-
-                // printf("完整时间戳（秒.纳秒）: %ld.%09ld\n", g_output_info.ts.tv_sec, g_output_info.ts.tv_nsec);
-                //     printf("pitch: %f, roll: %f, yaw: %f\n", 
-			    // g_output_info.angle_rate.x, g_output_info.angle_rate.y, g_output_info.angle_rate.z);
-                //     printf("accel.x: %f, accel.y: %f, accel.z: %f\n", 
-			    // g_output_info.accel.x , g_output_info.accel.y , g_output_info.accel.z );
-                
-                fprintf(fp,"%d,%ld,%09ld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,\n",
+                fprintf(fp,"%d,%ld,%09ld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                     num,
                     g_output_info.ts.tv_sec, 
                     g_output_info.ts.tv_nsec,
@@ -150,7 +147,11 @@ int main(int argc, char **argv)
                     g_output_info.angle_rate.z,
                     g_output_info.accel.x,
                     g_output_info.accel.y,
-                    g_output_info.accel.z          
+                    g_output_info.accel.z,
+                    g_output_info.attitude.quaternion_data0,
+                    g_output_info.attitude.quaternion_data1, 
+                    g_output_info.attitude.quaternion_data2, 
+                    g_output_info.attitude.quaternion_data3         
                 );
             }
 	    }

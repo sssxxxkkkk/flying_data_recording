@@ -53,14 +53,22 @@ chmod +x ./launch/launch_all.sh
 sh ./launch/launch_all.sh
 ```
 
-## 数据保存与回放
+## 数据处理/工具箱
 - **回放事件数据**  
 ```
-./launch/dvsense_file_reader your_file_name.raw （请替换 your_file_name.raw 为实际文件名）
+./tools/dvsense_file_reader your_file_name.raw （请替换 your_file_name.raw 为实际文件名）
 ```
 - **回放event+image数据(default path ./save_data)**  
 ```
-./launch/dvsense_fusion_reader
+./tools/dvsense_fusion_reader
+```
+- **将事件/图像/imu数据转为rosbag文件 (数据路径必须为默认)**  
+```
+python ./tools/dvsense_to_bag.py your_file_name.raw
+```
+- **标定无人机与惯导的旋转矩阵（）**
+```
+python ./tools/calib_rotation.py
 ```
 - **已保存数据目录**  
 ```
