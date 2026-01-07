@@ -10,11 +10,37 @@
 #include     <string.h>
 #include     <getopt.h>
 #include     "analysis_data.h"
-#include <bits/time.h>
+#include     <bits/time.h>
 
-// #include <stdio.h>
-// #include <time.h>
-// #include <linux/time.h>
+#ifdef _WIN32
+#include <direct.h>
+#define MKDIR(path) _mkdir(path)
+#else
+#define MKDIR(path) mkdir(path, 0777)
+#endif
+
+// 辅助函数：递归创建目录
+void create_directories(const char *file_path) {
+    char temp[256];
+    char *p = NULL;
+    size_t len;
+
+    snprintf(temp, sizeof(temp), "%s", file_path);
+    len = strlen(temp);
+    if (temp[len - 1] == '/') temp[len - 1] = 0;
+
+    // 逐层遍历路径，遇到 '/' 则创建目录
+    for (p = temp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (MKDIR(temp) != 0 && errno != EEXIST) {
+                // 如果目录已存在，忽略错误；否则报错
+            }
+            *p = '/';
+        }
+    }
+}
+
 
 /*----------------------------------------------------------------------*/
 #define TRUE 		1
@@ -30,18 +56,15 @@ char SENSOR_DATA_PATH[256] = "/home/orangepi/wendy/AirCraftEyeV6.1/yesense_decod
 /*----------------------------------------------------------------------*/
 int main(int argc, char **argv)
 {
-    printf("使用方法: %s <文件路径>\n", argv[0]);
-    // 检查是否有参数传入
-    char path[1000] = "../save_data"
-    if (argc > 2) {   
-        // argv[1] 就是第一个参数（路径）
-        
-        strcp(path, argv[1]);
-	path = argv[1];
-	printf("传入的路径: %s\n", path);
-    }
-    
+    char path[256] = "../save_data/infrared_data/infrared_data.txt";
 
+    if (argc > 2) {
+        strncpy(path, argv[1], sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    }
+
+    // 1. 先确保目录结构存在
+    create_directories(path);
 
     int fd;
     int nread;
@@ -54,7 +77,7 @@ int main(int argc, char **argv)
     int pos = 0;
     int num=0;
 
-    speed_t speed = B460800;
+    speed_t speed = B921600;
     dev = "/dev/ttyAMA0";	
     fd = open(dev, O_RDWR | O_NONBLOCK| O_NOCTTY | O_NDELAY); 
     if (fd < 0)	{
