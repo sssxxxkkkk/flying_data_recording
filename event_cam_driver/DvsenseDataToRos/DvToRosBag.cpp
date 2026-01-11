@@ -2,7 +2,7 @@
 #include "DvsenseDriver/camera/FusionCamera.hpp"
 #include "DvsenseDriver/FileReader/DvsFileReader.h"
 #include <condition_variable>
-#include"DvsenseBase/Utils/Json/JsonUtils.hpp"
+#include "DvsenseBase/Utils/Json/JsonUtils.hpp"
 #include <filesystem> // C++17
 #include <regex>
 #include <vector>
@@ -35,9 +35,9 @@ bool isAllDigits(const std::string& s) {
 }
 
 
-// Helper: parse sync_signal.txt -> map system_time (ns) to cam_time (ns)
+// Helper: parse sync_signal.txt -> map cam_time (us) to system_time (us)
 std::map<uint64_t, int64_t> loadSyncSignal(const std::string& path) {
-    std::map<uint64_t, int64_t> offset_map; // system_time_ns -> delta_t (cam - sys)
+    std::map<uint64_t, int64_t> offset_map; // system_time_us -> delta_t (cam - sys) in microseconds
     std::ifstream file(path);
     if (!file.is_open()) {
         ROS_ERROR("Cannot open sync_signal.txt: %s", path.c_str());
@@ -48,17 +48,15 @@ std::map<uint64_t, int64_t> loadSyncSignal(const std::string& path) {
     while (std::getline(file, line)) {
         if (line.empty()) continue;
         std::istringstream iss(line);
-        uint64_t cam_ts, sys_sec, sys_nsec;
-        int64_t delta_t;
-        char comma;
-        // 格式: cam_timestamp system_time delta_t
-        // 注意：system_time 可能是 sec.nsec 或直接 ns，根据你的实际格式调整
-        // 假设 sync_signal.txt 是：cam_ts sys_sec sys_nsec delta_t
-        if (!(iss >> cam_ts >> sys_sec >> sys_nsec >> delta_t)) {
+        uint64_t cam_ts, sys_ts;
+        double delta_t;
+        // cam_timestamp system_time delta_t (全部为微秒单位)
+        if (!(iss >> cam_ts >> sys_ts >> delta_t)) {
             continue;
         }
-        uint64_t sys_ts_ns = sys_sec * 1000000000ULL + sys_nsec;
-        offset_map[sys_ts_ns] = delta_t; // cam_ts - sys_ts = delta_t
+        // 计算时间偏差: cam_ts - sys_ts (单位: 微秒)
+        int64_t calculated_delta = static_cast<int64_t>(sys_ts - cam_ts);
+        offset_map[cam_ts] = calculated_delta; // system timestamp -> camera-system time offset
     }
     return offset_map;
 }
@@ -66,13 +64,42 @@ std::map<uint64_t, int64_t> loadSyncSignal(const std::string& path) {
 // Helper: linear interpolation for time offset
 int64_t interpolateOffset(const std::map<uint64_t, int64_t>& offsets, uint64_t sys_ts_ns) {
     if (offsets.empty()) return 0;
-    auto it = offsets.upper_bound(sys_ts_ns);
+    
+    // 静态变量用于缓存上次的迭代器位置，以优化连续时间戳的查找
+    static auto last_it = offsets.begin();
+    static bool first_call = true;
+    
+    if (first_call) {
+        last_it = offsets.begin();
+        first_call = false;
+    }
+    
+    // 如果当前时间戳大于等于上次的位置，从当前位置继续搜索
+    auto it = last_it;
+    if (sys_ts_ns >= last_it->first) {
+        // 向前搜索直到找到合适的位置
+        while (std::next(it) != offsets.end() && std::next(it)->first <= sys_ts_ns) {
+            ++it;
+        }
+        // 更新缓存位置
+        last_it = it;
+    } else {
+        // 如果时间戳回退了，使用标准查找方法
+        it = offsets.upper_bound(sys_ts_ns);
+        if (it != offsets.begin()) {
+            last_it = std::prev(it);
+        } else {
+            last_it = it;
+        }
+    }
+    
     if (it == offsets.begin()) {
         return it->second;
     }
     if (it == offsets.end()) {
         return (--it)->second;
     }
+    
     auto it_prev = std::prev(it);
     uint64_t t0 = it_prev->first, t1 = it->first;
     int64_t o0 = it_prev->second, o1 = it->second;
@@ -81,10 +108,10 @@ int64_t interpolateOffset(const std::map<uint64_t, int64_t>& offsets, uint64_t s
     return static_cast<int64_t>(o0 + ratio * (o1 - o0));
 }
 
-// Helper: load IMU data and convert to camera time
-std::vector<std::tuple<uint64_t, Eigen::Vector3d, Eigen::Vector3d>> 
-loadImuData(const std::string& path, const std::map<uint64_t, int64_t>& sync_offsets) {
-    std::vector<std::tuple<uint64_t, Eigen::Vector3d, Eigen::Vector3d>> imu_data;
+// Helper: load IMU data
+std::vector<std::tuple<uint64_t, Eigen::Vector3d, Eigen::Vector3d, Eigen::Vector4d>> 
+loadImuData(const std::string& path) {
+    std::vector<std::tuple<uint64_t, Eigen::Vector3d, Eigen::Vector3d, Eigen::Vector4d>> imu_data;
     std::ifstream file(path);
     if (!file.is_open()) {
         ROS_ERROR("Cannot open inertial_data.txt: %s", path.c_str());
@@ -94,26 +121,27 @@ loadImuData(const std::string& path, const std::map<uint64_t, int64_t>& sync_off
     std::string line;
     while (std::getline(file, line)) {
         if (line.empty()) continue;
-        // 格式: num,sec,nsec,wx,wy,wz,ax,ay,az,
+        // 格式: num,time_stample_sec,time_stample_nsec,angle_rate.x,angle_rate.y,angle_rate.z,accel.x, accel.y, accel.z, quaternion0, quaternion1, quaternion2, quaternion3
         std::replace(line.begin(), line.end(), ',', ' ');
         std::istringstream iss(line);
         int num;
-        long sec; long nsec;
+        long sec, nsec;
         double wx, wy, wz, ax, ay, az;
-        if (!(iss >> num >> sec >> nsec >> wx >> wy >> wz >> ax >> ay >> az)) {
+        double quat0, quat1, quat2, quat3;  // 四元数数据 (w, x, y, z)
+        
+        if (!(iss >> num >> sec >> nsec >> wx >> wy >> wz >> ax >> ay >> az >> quat0 >> quat1 >> quat2 >> quat3)) {
             continue;
         }
 
-        uint64_t sys_ts_ns = static_cast<uint64_t>(sec) * 1000000000ULL + static_cast<uint64_t>(nsec);
-        int64_t offset = interpolateOffset(sync_offsets, sys_ts_ns);
-        uint64_t cam_ts_ns = sys_ts_ns + offset;
+        uint64_t imu_ts_ns = static_cast<uint64_t>(sec) * 1000000000ULL + static_cast<uint64_t>(nsec);
 
         Eigen::Vector3d gyro(wx, wy, wz);
         Eigen::Vector3d accel(ax, ay, az);
-        imu_data.emplace_back(cam_ts_ns, gyro, accel);
+        Eigen::Vector4d quat(quat0, quat1, quat2, quat3);  // w, x, y, z
+        imu_data.emplace_back(imu_ts_ns, gyro, accel, quat);
     }
 
-    // Sort by camera timestamp
+    // Sort by IMU timestamp
     std::sort(imu_data.begin(), imu_data.end(),
         [](const auto& a, const auto& b) {
             return std::get<0>(a) < std::get<0>(b);
@@ -136,11 +164,12 @@ int main(int argc, char *argv[])
     ros::NodeHandle nh;
 
     // ----------------- 路径配置 -----------------
-    std::string image_folder = "../save_data/image_data";
-    std::string dvs_file_path = "../save_data/event_data/events.raw";
-    std::string sync_file = "../save_data/event_data/sync_signal.txt";
-    std::string imu_file = "../save_data/inertial_data/inertial_data.txt"; // 修正路径
-    std::string output_bag = "output.bag";
+    std::string base_path = "/media/songxiaokai/E1/svn/flying_data_recording/save_data";
+    std::string image_folder = base_path + "/image_data";
+    std::string dvs_file_path = base_path + "/event_data/events.raw";
+    std::string sync_file = base_path + "/event_data/sync_signal.txt";
+    std::string imu_file = base_path + "/inertial_data/inertial_data.txt"; // 修正路径
+    std::string output_bag = base_path + "/output.bag";
 
     // ----------------- 加载同步信号 -----------------
     auto sync_offsets = loadSyncSignal(sync_file);
@@ -152,12 +181,12 @@ int main(int argc, char *argv[])
     rosbag::Bag bag;
     bag.open(output_bag, rosbag::bagmode::Write);
 
-    // ----------------- 1. 写入 ALL IMU DATA（转为相机时间） -----------------
+    // ----------------- 1. 写入 ALL IMU DATA（系统时间） -----------------
     ROS_INFO("Loading and writing all IMU data...");
-    auto imu_data = loadImuData(imu_file, sync_offsets);
-    for (const auto& [cam_ts_ns, gyro, accel] : imu_data) {
+    auto imu_data = loadImuData(imu_file);
+    for (const auto& [imu_ts_ns, gyro, accel, quat] : imu_data) {
         sensor_msgs::Imu imu_msg;
-        imu_msg.header.stamp = ros::Time(cam_ts_ns / 1000000000ULL, cam_ts_ns % 1000000000ULL);
+        imu_msg.header.stamp = ros::Time(imu_ts_ns / 1000000000ULL, imu_ts_ns % 1000000000ULL);
         imu_msg.header.frame_id = "imu";
 
         imu_msg.angular_velocity.x = gyro.x();
@@ -168,13 +197,18 @@ int main(int argc, char *argv[])
         imu_msg.linear_acceleration.y = accel.y();
         imu_msg.linear_acceleration.z = accel.z();
 
+        // 设置姿态四元数 (w, x, y, z)
+        imu_msg.orientation.w = quat.x();  // w
+        imu_msg.orientation.x = quat.y();  // x
+        imu_msg.orientation.y = quat.z();  // y
+        imu_msg.orientation.z = quat.w();  // z
+
         imu_msg.angular_velocity_covariance.fill(0.0);
         imu_msg.linear_acceleration_covariance.fill(0.0);
 
         imu_msg.orientation_covariance.fill(0.0); 
-        imu_msg.orientation_covariance[0] = -1.0; 
 
-        bag.write("/imu/data", imu_msg.header.stamp, imu_msg);
+        bag.write("/imu/", imu_msg.header.stamp, imu_msg);
     }
     ROS_INFO("Wrote %zu IMU messages.", imu_data.size());
 
@@ -200,6 +234,10 @@ int main(int argc, char *argv[])
     dvsense::TimeStamp current_time = dvs_start;
     size_t total_event_count = 0;
 
+    // 全局变量用于优化连续时间戳的查找
+    static uint64_t g_last_search_key = 0;
+    static std::map<uint64_t, int64_t>::const_iterator g_last_it;
+
     while (current_time < dvs_end) {
         auto events_chunk = dvs_reader->getNTimeEventsGivenStartTimeStamp(current_time, CHUNK_SIZE);
         if (!events_chunk || events_chunk->empty()) break;
@@ -214,11 +252,15 @@ int main(int argc, char *argv[])
             e.x = ev.x;
             e.y = ev.y;
             e.polarity = ev.polarity;
-            // 事件时间戳已经是相机域，直接转换为 ros::Time
+            // 应用时间偏移：将相机时间戳转换为系统时间戳
+            uint64_t cam_ts_us = ev.timestamp;
+            int64_t offset = interpolateOffset(sync_offsets, cam_ts_us); // 获取系统时间与相机时间的偏移
+            uint64_t sys_ts_us = cam_ts_us + offset; // 系统时间 = 相机时间 + 偏移
+            
             if (EVENT_TS_IN_MICROSECONDS) {
-                e.ts = ros::Time(ev.timestamp / 1000000ULL, (ev.timestamp % 1000000ULL) * 1000);
+                e.ts = ros::Time(sys_ts_us / 1000000ULL, (sys_ts_us % 1000000ULL) * 1000);
             } else {
-                e.ts = ros::Time(ev.timestamp / 1000000000ULL, ev.timestamp % 1000000000ULL);
+                e.ts = ros::Time(sys_ts_us / 1000000000ULL, sys_ts_us % 1000000000ULL);
             }
             event_array_msg.events.push_back(e);
         }
@@ -246,8 +288,10 @@ int main(int argc, char *argv[])
         if (filename.size() > 4 && filename.substr(filename.size() - 4) == ".bmp") {
             std::string stem = filename.substr(0, filename.size() - 4);
             if (isAllDigits(stem)) {
-                uint64_t ts = std::stoull(stem);
-                timestamped_images.emplace_back(ts, filepath);
+                uint64_t cam_img_ts = std::stoull(stem); // 图像的相机时间戳
+                int64_t img_offset = interpolateOffset(sync_offsets, cam_img_ts); // 获取时间偏移
+                uint64_t sys_img_ts = cam_img_ts + img_offset; // 转换为系统时间戳
+                timestamped_images.emplace_back(sys_img_ts, filepath); // 存储系统时间戳
             }
         }
     }
