@@ -19,6 +19,7 @@ def parse_uav_data(file_path):
     matches = re.findall(pattern, content)
     
     # 处理时间戳对
+    last_efficient_timestamp = 0
     for i in range(len(matches) - 1):  # 避免超出索引
         # 解析第一个数据点
         first_match = matches[i]
@@ -48,11 +49,12 @@ def parse_uav_data(file_path):
         
         # 检查条件：第二个时间戳比第一个大，且差值小于0.05
         time_diff = second_ts - first_ts
-        if time_diff > 0 and time_diff < 0.05:
+        if time_diff > 0 and time_diff < 0.05 and first_ts > last_efficient_timestamp:
             # 检查四元数是否有效并添加第一个数据点
             if np.linalg.norm(first_quat) > 0:
                 rot = R.from_quat(first_quat)
                 data.append({'ts': first_ts, 'rot': rot})
+                last_efficient_timestamp  = first_ts
         else:
             # 不满足条件，继续处理后续数据
             continue
@@ -62,6 +64,7 @@ def parse_uav_data(file_path):
 def parse_iner_data(file_path):
     """解析惯导数据: R^IMU_W_Body (Body to World)"""
     data = []
+    prv_ts = 0
     with open(file_path, 'r') as f:
         for line in f:
             line = line.strip()
@@ -72,6 +75,11 @@ def parse_iner_data(file_path):
                 continue
             try:
                 ts = int(parts[1]) + int(parts[2]) / 1e9
+
+                if ts < prv_ts:
+                    continue
+                
+                prv_ts = ts
                 # 按照数据格式: num, time_stample_sec, time_stample_nsec, angle_rate.x, angle_rate.y, 
                 # angle_rate.z, accel.x, accel.y, accel.z, quaternion0, quaternion1, quaternion2, quaternion3
                 # 通常q0是标量部分w，q1,q2,q3是x,y,z向量部分
@@ -445,7 +453,6 @@ def solve_hand_eye(uav_list,iner_list,estimated_delay):
             R_body_in_c = slerp(uav_list[idx]['ts']-estimated_delay).as_matrix()
             R_const = np.linalg.inv(R_uav_in_w) @ R_x @ R_body_in_c
             
-            print(R_const)
             trace = np.trace(R_const)
             angle_rad = np.arccos(np.clip((trace - 1) / 2, -1, 1))  # 限制在[-1,1]范围内
             angle_deg = np.degrees(angle_rad)
