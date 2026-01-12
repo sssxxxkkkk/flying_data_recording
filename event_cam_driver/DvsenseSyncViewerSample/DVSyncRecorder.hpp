@@ -119,6 +119,7 @@ private:
 
     std::queue<SyncTimestamp> trigger_queue_;
     std::mutex queue_mutex_;
+    std::mutex delta_t_mutex_;
     std::condition_variable queue_cv_;
     std::thread worker_thread_;
     bool stop_worker_ = false;
@@ -129,6 +130,8 @@ private:
     std::string dest_ip = "192.168.10.1";
     int dest_port = 5000;
     VideoSender v_sender;
+    bool save_images_;
+    bool udp_display_;
     
     // 同步文件流
     std::ofstream sync_file_stream_;
@@ -145,7 +148,7 @@ private:
                 // 处理剩余的触发信号数据
                 while (!trigger_queue_.empty()) {
                     std::cout << "处理剩余同步信号数据..." << std::endl;
-                    auto trigger_in = std::move(trigger_queue_.front());
+                    auto sync_ts = std::move(trigger_queue_.front());
                     trigger_queue_.pop();
                     lock.unlock();
                     
@@ -160,7 +163,7 @@ private:
                         }
                         
                         // 写入同步信号信息：相机时间戳 系统时间戳 差值
-                        sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << current_delta_t << std::endl;
+                        sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << delta_t << std::endl;
                         sync_file_stream_.flush();
                     }
                     
@@ -186,12 +189,27 @@ private:
                         cv::Mat image_rgb;
                         cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
                         cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
-                        cv::imwrite(image_filename, image_bgr);
-                        v_sender.sendFrame(image_bgr);  
+                        if(save_images_)
+                        {
+                          cv::imwrite(image_filename, image_bgr);
+                        }
+                        if(udp_display_)
+                        {
+                          v_sender.sendFrame(image_bgr);
+                        }
+                          
                     } else {
                         cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
-                        cv::imwrite(image_filename, image_bgr);
-                        v_sender.sendFrame(image);  
+                        if(save_images_)
+                        {
+                          cv::imwrite(image_filename, image_bgr);
+                        }
+                        
+                        if(udp_display_)
+                        {
+                          v_sender.sendFrame(image); 
+                        }
+                         
                     }
 
                     lock.lock();
@@ -227,7 +245,7 @@ private:
                     }
                     
                     // 写入同步信号信息：相机时间戳 系统时间戳 差值
-                    sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << current_delta_t << std::endl;
+                    sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << delta_t << std::endl;
                     sync_file_stream_.flush();
                 }
                 
@@ -253,16 +271,31 @@ private:
                 cv::Mat image_bgr;
 
                 if (is_calibrated_) {
-                    cv::Mat image_rgb;
-                    cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
-                    cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
-                    cv::imwrite(image_filename, image_bgr);
-                    v_sender.sendFrame(image_bgr);  
-                } else {
-                    cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
-                    cv::imwrite(image_filename, image_bgr);
-                    v_sender.sendFrame(image);  
-                }
+                        cv::Mat image_rgb;
+                        cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
+                        cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
+                        if(save_images_)
+                        {
+                          cv::imwrite(image_filename, image_bgr);
+                        }
+                        if(udp_display_)
+                        {
+                          v_sender.sendFrame(image_bgr);
+                        }
+                          
+                    } else {
+                        cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
+                        if(save_images_)
+                        {
+                          cv::imwrite(image_filename, image_bgr);
+                        }
+                        
+                        if(udp_display_)
+                        {
+                          v_sender.sendFrame(image); 
+                        }
+                         
+                    }
                                               
                 lock.lock();
             }
@@ -278,8 +311,7 @@ public:
     std::string file_path_events_;
     std::string sync_filename_;
     
-    DvsenseRecorder(std::string file_path, std::string& dest_ip, int dest_port ): dest_ip(dest_ip), dest_port(dest_port), 
-      v_sender(dest_ip, dest_port)
+    DvsenseRecorder(std::string file_path, bool save_images, bool udp_display, std::string& dest_ip, int dest_port ): save_images_(save_images), udp_display_(udp_display), dest_ip(dest_ip), dest_port(dest_port), v_sender(dest_ip, dest_port)
     {
         file_path_ = file_path;
         file_path_images_ = file_path + "/image_data";

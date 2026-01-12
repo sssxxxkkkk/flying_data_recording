@@ -29,15 +29,14 @@ bool stop_thread = false;
 string base_path = "../save_data/infrared_data/";
 
 // 获取高精度时间戳字符串
-string getCurrentTimestamp() {
-    auto now = chrono::system_clock::now();
-    auto in_time_t = chrono::system_clock::to_time_t(now);
-    auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
+std::string getCurrentTimestamp() {
+    // 使用 system_clock 获取 Unix 时间戳
+    auto now = std::chrono::system_clock::now();
+    // 转换为毫秒
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    auto millis = duration.count();
     
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&in_time_t));
-    sprintf(buf + strlen(buf), "_%03ld", ms.count());
-    return string(buf);
+    return std::to_string(millis);
 }
 
 // 消费者线程：专门负责存图，降低主线程延迟
