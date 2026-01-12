@@ -110,7 +110,14 @@ class DvsenseRecorder
 {
 private:
     std::queue<dvsense::ApsFrame> frame_queue_;
-    std::queue<dvsense::EventTriggerIn> trigger_queue_;  // 新增触发信号队列
+    
+    struct SyncTimestamp {
+        uint64_t cam_timestamp;
+        uint64_t system_timestamp;
+        int polarity;
+    };
+
+    std::queue<SyncTimestamp> trigger_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::thread worker_thread_;
@@ -143,16 +150,20 @@ private:
                     lock.unlock();
                     
                     // 记录同步信号到文件
-                    if (trigger_in.polarity == 0 && sync_file_stream_.is_open()) {
-                        uint64_t cam_timestamp = trigger_in.timestamp;
-                        auto system_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-                        delta_t = (double)(system_time - cam_timestamp);
+                    if (sync_ts.polarity == 0 && sync_file_stream_.is_open()) {
+                        uint64_t cam_timestamp = sync_ts.cam_timestamp;
+                        uint64_t system_timestamp = sync_ts.system_timestamp;
+                        
+                        {
+                            std::lock_guard<std::mutex> lock(delta_t_mutex_);
+                            delta_t = system_timestamp - cam_timestamp;
+                        }
                         
                         // 写入同步信号信息：相机时间戳 系统时间戳 差值
-                        sync_file_stream_ << cam_timestamp << " " << system_time << " " << delta_t << std::endl;
+                        sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << current_delta_t << std::endl;
                         sync_file_stream_.flush();
                     }
+                    
                     
                     lock.lock();
                 }
@@ -200,20 +211,24 @@ private:
             
             while (!trigger_queue_.empty() && triggers_processed < max_triggers_per_batch) {
                 std::cout << "处理同步信号数据..." << std::endl;
-                auto trigger_in = std::move(trigger_queue_.front());
+                auto sync_ts = std::move(trigger_queue_.front());
                 trigger_queue_.pop();
                 triggers_processed++;
                 lock.unlock();
                 
                 // 记录同步信号到文件
-                if (trigger_in.polarity == 0 && sync_file_stream_.is_open()) {
-                    uint64_t cam_timestamp = trigger_in.timestamp;
-                    auto system_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-                    delta_t = (double)(system_time - cam_timestamp);
+                if (sync_ts.polarity == 0 && sync_file_stream_.is_open()) {
+                    uint64_t cam_timestamp = sync_ts.cam_timestamp;
+                    uint64_t system_timestamp = sync_ts.system_timestamp;
+      
+                    {
+                        std::lock_guard<std::mutex> lock(delta_t_mutex_);
+                        delta_t = system_timestamp - cam_timestamp;
+                    }
                     
                     // 写入同步信号信息：相机时间戳 系统时间戳 差值
-                    sync_file_stream_ << cam_timestamp << " " << system_time << " " << delta_t << std::endl;
+                    sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << current_delta_t << std::endl;
+                    sync_file_stream_.flush();
                 }
                 
                 lock.lock();
@@ -257,7 +272,7 @@ private:
     }
 
 public:
-    double delta_t = 0;      // 相机时间 + delta_t = 系统时间
+    uint64_t delta_t = 0;      // 相机时间 + delta_t = 系统时间
     std::string file_path_;
     std::string file_path_images_;
     std::string file_path_events_;
@@ -326,7 +341,7 @@ public:
     // 保存图像
     void save_images(const dvsense::ApsFrame frame)
     {
-        // 图像名称为 file_path_images_ + "/" + frame.exposure_end_timestamp + delta_t + ".png"
+        // 图像名称为 file_path_images_ + "/" + frame.exposure_end_timestamp + ".bmp"
 
         // 寻找高效的保存方式
         // 将图像帧放入队列，由工作线程处理
@@ -338,9 +353,18 @@ public:
     // 更新delta_t并记录同步信号
     void update_delta_t(const dvsense::EventTriggerIn &trigger_in)
     {
-        // 将触发信号放入队列，由工作线程处理
+        // 在接收触发信号时立即获取系统时间戳
+        auto system_time = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+            
+        SyncTimestamp sync_ts;
+        sync_ts.cam_timestamp = trigger_in.timestamp;
+        sync_ts.system_timestamp = system_time;
+        sync_ts.polarity = trigger_in.polarity;
+
+        // 将触发信号和对应系统时间放入队列，由工作线程处理
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        trigger_queue_.push(trigger_in);
+        trigger_queue_.push(sync_ts);
         queue_cv_.notify_one();
     }
 
