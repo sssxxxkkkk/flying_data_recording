@@ -115,8 +115,8 @@ int main(int argc, char **argv)
     }
     
     // CSV表头 - 使用逗号分隔
-    fprintf(fp, "num, time_stample_sec, time_stample_nsec, angle_rate.x, angle_rate.y, angle_rate.z,");
-    fprintf(fp, "accel.x, accel.y, accel.z, quaternion0, quaternion1, quaternion2, quaternion3\n");
+    fprintf(fp, "num, time_stample_sec, time_stample_nsec, r_x, r_y, r_z,");
+    fprintf(fp, "a_x, a_y, a_z, q_w, q_x, q_y, q_z\n");
 
     fflush(fp);
 
