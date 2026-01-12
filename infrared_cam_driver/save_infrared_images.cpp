@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <filesystem>
 
 using namespace std;
 using namespace cv;
@@ -25,6 +26,7 @@ queue<SaveTask> saveQueue;
 mutex mtx;
 condition_variable cv_cond;
 bool stop_thread = false;
+string base_path = "../save_data/infrared_data/";
 
 // 获取高精度时间戳字符串
 string getCurrentTimestamp() {
@@ -54,22 +56,36 @@ void imageWriterThread() {
         
         // 执行耗时的写盘操作
         if (!task.frame.empty()) {
-            imwrite(task.filename, task.frame, {IMWRITE_JPEG_QUALITY, 95});
+            imwrite(base_path + task.filename, task.frame);
         }
     }
 }
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        cout << "用法: " << argv[0] << " <是否存图:0/1> <是否使用UDP传输:0/1> [IP] [端口]" << endl;
+        cout << "method: " << argv[0] << " <save image? 0/1> <use udp for display? 0/1> [IP] [port]" << endl;
         return -1;
     }
 
     bool enableSave = (stoi(argv[1]) == 1);
     bool enableUDP = (stoi(argv[2]) == 1);
-    string ip = (argc >= 4) ? argv[3] : "127.0.0.1";
-    int port = (argc >= 5) ? stoi(argv[4]) : 8080;
+    string ip = (argc >= 4) ? argv[3] : "192.168.10.1";
+    int port = (argc >= 5) ? stoi(argv[4]) : 5000;
 
+
+    if (!std::filesystem::exists(base_path))
+	{
+	    std::filesystem::create_directory(base_path);
+	}
+    else 
+    {
+	  // 如果文件夹存在，清空文件夹中的所有内容
+  	for (const auto& entry : std::filesystem::directory_iterator(base_path)) 
+  	{
+    	   std::filesystem::remove_all(entry.path());
+  	}
+    }
+    
     // 1. 初始化摄像头
     VideoCapture cap(0);
     if (!cap.isOpened()) return -1;
@@ -102,7 +118,7 @@ int main(int argc, char** argv) {
 
         // B. 如果需要存图，将任务丢入队列，立即返回
         if (enableSave) {
-            string ts = getCurrentTimestamp() + ".jpg";
+            string ts = getCurrentTimestamp() + ".bmp";
             {
                 lock_guard<mutex> lock(mtx);
                 // 限制队列长度避免内存溢出，如果写磁盘太慢，丢弃旧帧保证实时性
@@ -116,13 +132,13 @@ int main(int argc, char** argv) {
         // C. 处理 UDP 发送流 (使用编码压缩，减小带宽瓶颈)
         if (enableUDP) {
             vector<uchar> buf;
-            imencode(".jpg", frame, buf, {IMWRITE_JPEG_QUALITY, 70});
+            imencode(".jpg", frame, buf, {IMWRITE_JPEG_QUALITY, 50});
             if (buf.size() <= 65507) {
                 sendto(sockfd, buf.data(), buf.size(), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
             }
         }
 
-        imshow("XSimple Stream", frame);
+        //imshow("XSimple Stream", frame);
         if (waitKey(1) == 27) break;
     }
 

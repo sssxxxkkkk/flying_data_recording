@@ -4,8 +4,8 @@ cmake_minimum_required(VERSION 3.10)
 # 项目名称
 project(save_infrared)
 
-# 设置 C++ 标准为 C++14 (支持 chrono, thread 等)
-set(CMAKE_CXX_STANDARD 14)
+# 设置 C++ 标准为 C++17 (支持 chrono, thread 等)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 1. 查找 OpenCV 库

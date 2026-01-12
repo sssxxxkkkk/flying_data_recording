@@ -56,7 +56,7 @@ char SENSOR_DATA_PATH[256] = "/home/orangepi/wendy/AirCraftEyeV6.1/yesense_decod
 /*----------------------------------------------------------------------*/
 int main(int argc, char **argv)
 {
-    char path[256] = "../save_data/infrared_data/infrared_data.txt";
+    char path[256] = "../save_data/inertial_data/inertial_data.txt";
 
     if (argc > 2) {
         strncpy(path, argv[1], sizeof(path) - 1);
@@ -78,9 +78,11 @@ int main(int argc, char **argv)
     int num=0;
 
     speed_t speed = B921600;
-    dev = "/dev/ttyAMA0";	
+    //speed_t speed = B460800;
+    dev = "/dev/wheeltec_IMU";	
     fd = open(dev, O_RDWR | O_NONBLOCK| O_NOCTTY | O_NDELAY); 
-    if (fd < 0)	{
+    if (fd < 0)	
+    {
         printf("Can't Open Serial Port!\n");
         exit(0);	
     }
@@ -121,14 +123,16 @@ int main(int argc, char **argv)
     while(1)
     {
 	nread = read(fd, buffer, RX_BUF_LEN);
+	//printf("nread = %d\n", nread);
 	if(nread > 0)
 	{
-	    //printf("nread = %d\n", nread);
+	    // printf("nread = %d\n", nread);
 	    memcpy(g_recv_buf + g_recv_buf_idx, buffer, nread);             
 	    g_recv_buf_idx += nread;
 	}
 
         cnt = g_recv_buf_idx;
+        
         pos = 0;
         if(cnt < YIS_OUTPUT_MIN_BYTES)
         {
@@ -161,7 +165,7 @@ int main(int argc, char **argv)
                 // 获取系统实时时间（最精确）
                 clock_gettime(CLOCK_REALTIME, &g_output_info.ts);
 
-                fprintf(fp,"%d,%ld,%09ld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                fprintf(fp,"%d,%ld,%09ld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                     num,
                     g_output_info.ts.tv_sec, 
                     g_output_info.ts.tv_nsec,
