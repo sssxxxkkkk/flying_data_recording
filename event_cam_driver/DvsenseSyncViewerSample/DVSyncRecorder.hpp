@@ -118,10 +118,13 @@ private:
     };
 
     std::queue<SyncTimestamp> trigger_queue_;
-    std::mutex queue_mutex_;
+    std::mutex frame_queue_mutex_;
+    std::mutex trigger_queue_mutex_;
     std::mutex delta_t_mutex_;
-    std::condition_variable queue_cv_;
-    std::thread worker_thread_;
+    std::condition_variable frame_queue_cv_;
+    std::condition_variable trigger_queue_cv_;
+    std::thread image_process_thread_;
+    std::thread sync_process_thread_;
     bool stop_worker_ = false;
     bool is_calibrated_ = false;
     cv::Mat map_x_, map_y_;
@@ -136,109 +139,125 @@ private:
     // 同步文件流
     std::ofstream sync_file_stream_;
 
-    void process_data() {
+    void process_images() {
         while (true) {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] { 
-                return !frame_queue_.empty() || !trigger_queue_.empty() || stop_worker_; 
+            std::unique_lock<std::mutex> lock(frame_queue_mutex_);
+            frame_queue_cv_.wait(lock, [this] { 
+                return !frame_queue_.empty() || stop_worker_; 
             });
             
-            // 检查是否需要退出
-            if (stop_worker_) {
-                // 处理剩余的触发信号数据
-                while (!trigger_queue_.empty()) {
-                    std::cout << "处理剩余同步信号数据..." << std::endl;
-                    auto sync_ts = std::move(trigger_queue_.front());
-                    trigger_queue_.pop();
-                    lock.unlock();
-                    
-                    // 记录同步信号到文件
-                    if (sync_ts.polarity == 0 && sync_file_stream_.is_open()) {
-                        uint64_t cam_timestamp = sync_ts.cam_timestamp;
-                        uint64_t system_timestamp = sync_ts.system_timestamp;
-                        
-                        {
-                            std::lock_guard<std::mutex> lock(delta_t_mutex_);
-                            delta_t = system_timestamp - cam_timestamp;
-                        }
-                        
-                        // 写入同步信号信息：相机时间戳 系统时间戳 差值
-                        sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << delta_t << std::endl;
-                        sync_file_stream_.flush();
-                    }
-                    
-                    
-                    lock.lock();
-                }
-                
-                // 处理剩余的图像数据
-                while (!frame_queue_.empty()) {
-                    std::cout << "处理剩余图像数据..." << std::endl;
-                    auto frame = std::move(frame_queue_.front());
-                    frame_queue_.pop();
-                    lock.unlock();
-                    
-                    // 保存图像到文件
-                    uint64_t exposure_timestamp = frame.exposure_start_timestamp;
-                    std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
-                    
-                    cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
-                    cv::Mat image_bgr;
-    
-                    if (is_calibrated_) {
-                        cv::Mat image_rgb;
-                        cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
-                        cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
-                        if(save_images_)
-                        {
-                          cv::imwrite(image_filename, image_bgr);
-                        }
-                        if(udp_display_)
-                        {
-                          v_sender.sendFrame(image_bgr);
-                        }
-                          
-                    } else {
-                        cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
-                        if(save_images_)
-                        {
-                          cv::imwrite(image_filename, image_bgr);
-                        }
-                        
-                        if(udp_display_)
-                        {
-                          v_sender.sendFrame(image); 
-                        }
-                         
-                    }
-
-                    lock.lock();
-                    }
-
-                // 关闭同步信号文件流
-                if (sync_file_stream_.is_open()) {
-                    sync_file_stream_.close();
-                }
-                
+            if (stop_worker_ && frame_queue_.empty()) {
                 break;
             }
             
-            // 处理触发信号数据
-            int triggers_processed = 0;
-            const int max_triggers_per_batch = 10;
+            if (!frame_queue_.empty()) {
+                auto frame = std::move(frame_queue_.front());
+                frame_queue_.pop();
+                lock.unlock();
+                
+                // 保存图像到文件
+                uint64_t exposure_timestamp = frame.exposure_end_timestamp;
+                std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
+                
+                cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
+                cv::Mat image_bgr;
+
+                if (is_calibrated_) {
+                    cv::Mat image_rgb;
+                    cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
+                    image_bgr = image_rgb;
+                    //cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
+                    if(save_images_)
+                    {
+                      cv::imwrite(image_filename, image_bgr);
+                    }
+                    if(udp_display_)
+                    {
+                      v_sender.sendFrame(image_bgr);
+                    }
+                      
+                } else {
+                    image_bgr = image;
+                    //cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
+                    if(save_images_)
+                    {
+                      cv::imwrite(image_filename, image_bgr);
+                    }
+                    
+                    if(udp_display_)
+                    {
+                      v_sender.sendFrame(image); 
+                    }
+                     
+                }
+            }
+        }
+        
+        // 处理剩余的图像数据
+        std::lock_guard<std::mutex> final_lock(frame_queue_mutex_);
+        while (!frame_queue_.empty()) {
+            auto frame = std::move(frame_queue_.front());
+            frame_queue_.pop();
             
-            while (!trigger_queue_.empty() && triggers_processed < max_triggers_per_batch) {
-                std::cout << "处理同步信号数据..." << std::endl;
+            // 保存图像到文件
+            uint64_t exposure_timestamp = frame.exposure_end_timestamp;
+            std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
+            
+            cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
+            cv::Mat image_bgr;
+
+            if (is_calibrated_) {
+                cv::Mat image_rgb;
+                cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
+                image_bgr = image_rgb;
+                if(save_images_)
+                {
+                  cv::imwrite(image_filename, image_bgr);
+                }
+                if(udp_display_)
+                {
+                  v_sender.sendFrame(image_bgr);
+                }
+                  
+            } else {
+                image_bgr = image;
+                if(save_images_)
+                {
+                  cv::imwrite(image_filename, image_bgr);
+                }
+                
+                if(udp_display_)
+                {
+                  v_sender.sendFrame(image); 
+                }
+                 
+            }
+        }
+        
+        std::cout << "图像处理线程退出" << std::endl;
+    }
+    
+    void process_sync_signals() {
+        while (true) {
+            std::unique_lock<std::mutex> lock(trigger_queue_mutex_);
+            trigger_queue_cv_.wait(lock, [this] { 
+                return !trigger_queue_.empty() || stop_worker_; 
+            });
+            
+            if (stop_worker_ && trigger_queue_.empty()) {
+                break;
+            }
+            
+            if (!trigger_queue_.empty()) {
                 auto sync_ts = std::move(trigger_queue_.front());
                 trigger_queue_.pop();
-                triggers_processed++;
                 lock.unlock();
                 
                 // 记录同步信号到文件
                 if (sync_ts.polarity == 0 && sync_file_stream_.is_open()) {
                     uint64_t cam_timestamp = sync_ts.cam_timestamp;
                     uint64_t system_timestamp = sync_ts.system_timestamp;
-      
+
                     {
                         std::lock_guard<std::mutex> lock(delta_t_mutex_);
                         delta_t = system_timestamp - cam_timestamp;
@@ -246,62 +265,38 @@ private:
                     
                     // 写入同步信号信息：相机时间戳 系统时间戳 差值
                     sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << delta_t << std::endl;
-                    sync_file_stream_.flush();
+                    //sync_file_stream_.flush();
                 }
-                
-                lock.lock();
-            }
-            
-            // 处理图像数据（保持原有逻辑）
-            int images_processed = 0;
-            const int max_images_per_batch = 5;
-            
-            while (!frame_queue_.empty() && images_processed < max_images_per_batch) {
-                std::cout << "处理图像数据..." << std::endl;
-                auto frame = std::move(frame_queue_.front());
-                frame_queue_.pop();
-                images_processed++;
-                lock.unlock();
-                
-                // 保存图像到文件
-                uint64_t exposure_timestamp = frame.exposure_start_timestamp;
-                std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
-                
-                cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
-                cv::Mat image_bgr;
-
-                if (is_calibrated_) {
-                        cv::Mat image_rgb;
-                        cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
-                        cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
-                        if(save_images_)
-                        {
-                          cv::imwrite(image_filename, image_bgr);
-                        }
-                        if(udp_display_)
-                        {
-                          v_sender.sendFrame(image_bgr);
-                        }
-                          
-                    } else {
-                        cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
-                        if(save_images_)
-                        {
-                          cv::imwrite(image_filename, image_bgr);
-                        }
-                        
-                        if(udp_display_)
-                        {
-                          v_sender.sendFrame(image); 
-                        }
-                         
-                    }
-                                              
-                lock.lock();
             }
         }
         
-        std::cout << "工作线程退出" << std::endl;
+        // 处理剩余的触发信号数据
+        std::lock_guard<std::mutex> final_lock(trigger_queue_mutex_);
+        while (!trigger_queue_.empty()) {
+            auto sync_ts = std::move(trigger_queue_.front());
+            trigger_queue_.pop();
+            
+            // 记录同步信号到文件
+            if (sync_ts.polarity == 0 && sync_file_stream_.is_open()) {
+                uint64_t cam_timestamp = sync_ts.cam_timestamp;
+                uint64_t system_timestamp = sync_ts.system_timestamp;
+                
+                {
+                    std::lock_guard<std::mutex> lock(delta_t_mutex_);
+                    delta_t = system_timestamp - cam_timestamp;
+                }
+                
+                // 写入同步信号信息：相机时间戳 系统时间戳 差值
+                sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << delta_t << std::endl;
+                //sync_file_stream_.flush();
+            }
+        }
+        
+        if (sync_file_stream_.is_open()) {
+            sync_file_stream_.close();
+        }
+        
+        std::cout << "同步信号处理线程退出" << std::endl;
     }
 
 public:
@@ -353,19 +348,25 @@ public:
              sync_file_stream_ << "cam_timestamp" << " " << "system_time" << " " << "delta_t" << std::endl;
         }
 
-        // 启动工作线程
-        worker_thread_ = std::thread(&DvsenseRecorder::process_data, this);
+        // 启动两个独立的工作线程
+        image_process_thread_ = std::thread(&DvsenseRecorder::process_images, this);
+        sync_process_thread_ = std::thread(&DvsenseRecorder::process_sync_signals, this);
     }
     
     // 析构函数，清理资源
     ~DvsenseRecorder() {
         {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
+            std::lock_guard<std::mutex> frame_lock(frame_queue_mutex_);
+            std::lock_guard<std::mutex> trigger_lock(trigger_queue_mutex_);
             stop_worker_ = true;
         }
-        queue_cv_.notify_all();
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
+        frame_queue_cv_.notify_all();
+        trigger_queue_cv_.notify_all();
+        if (image_process_thread_.joinable()) {
+            image_process_thread_.join();
+        }
+        if (sync_process_thread_.joinable()) {
+            sync_process_thread_.join();
         }
     }
     
@@ -377,9 +378,9 @@ public:
 
         // 寻找高效的保存方式
         // 将图像帧放入队列，由工作线程处理
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(frame_queue_mutex_);
         frame_queue_.push(frame);
-        queue_cv_.notify_one();
+        frame_queue_cv_.notify_one();
     }
    
     // 更新delta_t并记录同步信号
@@ -388,16 +389,17 @@ public:
         // 在接收触发信号时立即获取系统时间戳
         auto system_time = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-            
+        
         SyncTimestamp sync_ts;
         sync_ts.cam_timestamp = trigger_in.timestamp;
         sync_ts.system_timestamp = system_time;
         sync_ts.polarity = trigger_in.polarity;
-
+        
         // 将触发信号和对应系统时间放入队列，由工作线程处理
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(trigger_queue_mutex_);
+
         trigger_queue_.push(sync_ts);
-        queue_cv_.notify_one();
+        trigger_queue_cv_.notify_one();
     }
 
     void compute_remap(dvsense::CalibratorParameters cali_param)
@@ -432,9 +434,7 @@ public:
 				map_y_.at<float>(y, x) = aps_y;
             }
         }
-	}
-   
-
+	};
 };
 
 #endif // DVSYNC_RECORDER_HPP

@@ -28,7 +28,7 @@ int main(int argc, char *argv[])
     bool udp_display = true;    // 默认进行UDP显示
     std::string dest_ip = "192.168.10.1";
     int dest_port = 5000;
-    const std::string out_file_path = "../save_data/";  // 固定图片存储路径
+    const std::string out_file_path = "../save_data";  // 固定图片存储路径
 
     // ----------------- Parse command line arguments -----------------
     if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help"))
@@ -128,8 +128,15 @@ int main(int argc, char *argv[])
 
 			// 设置事件触发阈值
 			std::shared_ptr<dvsense::CameraTool> bias = camera->getTool(dvsense::ToolType::TOOL_BIAS);
-			bool ret = bias->setParam("bias_diff_on", 50);
-			ret = bias->setParam("bias_diff_off", 50);
+			std::shared_ptr<dvsense::CameraTool> aps = camera->getTool(dvsense::ToolType::TOOL_APS_CTRL);
+            //const std::vector<dvsense::ToolInfo> tools = camera->getAllToolsInfo();
+			// bool ret = bias->setParam("bias_diff_on", 30);
+			// ret = bias->setParam("bias_diff_off", 30);
+            bool ret;
+			ret = aps->setParam("auto_exposure", false);
+			ret = aps->setParam("exposure_time", 15000);
+			//ret = aps->setParam("auto_gain", false);
+			//ret = aps->setParam("gain", 10.0);
 
 			dvsense::CalibratorParameters cali_param;
 			if(camera->readCalibrationParam(cali_param))
@@ -145,17 +152,15 @@ int main(int argc, char *argv[])
 			// camera->addEventsStreamHandleCallback([&recorder](const dvsense::Event2D *begin, const dvsense::Event2D *end)
 			// 									  { recorder.save_events(begin, end); });
 			camera->addSyncSignalCallback([&recorder](const dvsense::EventTriggerIn &trigger_in)
-										 { recorder.update_delta_t(trigger_in); });
+					{ recorder.update_delta_t(trigger_in);});
 			camera->setStatisticInfoCallback([&statistic_info](const dvsense::DsStatisticInfo info)
 											 { statistic_info = info; });
 
 			camera->start();
 		}
 
-	
-                // 仅记录事件，通过相机的触发信号来同步
 		camera->startRecording(recorder.file_path_events_, "events", dvsense::DVS_STREAM);
-	        //camera->startRecording(recorder.file_path_events_, "events");
+	    //camera->startRecording(recorder.file_path_events_, "events");
 
 		std::string input_command;
 		std::getline(std::cin, input_command);

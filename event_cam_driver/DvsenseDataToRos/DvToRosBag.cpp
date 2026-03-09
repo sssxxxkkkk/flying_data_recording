@@ -164,7 +164,7 @@ int main(int argc, char *argv[])
     ros::NodeHandle nh;
 
     // ----------------- 路径配置 -----------------
-    std::string base_path = "/media/songxiaokai/E1/svn/flying_data_recording/save_data";
+    std::string base_path = "../save_data";
     std::string image_folder = base_path + "/image_data";
     std::string dvs_file_path = base_path + "/event_data/events.raw";
     std::string sync_file = base_path + "/event_data/sync_signal.txt";
@@ -173,7 +173,20 @@ int main(int argc, char *argv[])
 
     // ----------------- 加载同步信号 -----------------
     auto sync_offsets = loadSyncSignal(sync_file);
+
     if (sync_offsets.empty()) {
+        ROS_WARN("No sync signal loaded! IMU timestamps will not be corrected.");
+    }
+
+    int64_t avg_offset = 0;
+    if (!sync_offsets.empty()) {
+        int64_t sum = 0;
+        for (const auto& pair : sync_offsets) {
+            sum += pair.second;  // pair.second 是delta_t (cam - sys) in microseconds
+        }
+        avg_offset = sum / static_cast<int64_t>(sync_offsets.size());
+        ROS_INFO("Average sync offset calculated: %ld microseconds", avg_offset);
+    } else {
         ROS_WARN("No sync signal loaded! IMU timestamps will not be corrected.");
     }
 
@@ -184,98 +197,136 @@ int main(int argc, char *argv[])
     // ----------------- 1. 写入 ALL IMU DATA（系统时间） -----------------
     ROS_INFO("Loading and writing all IMU data...");
     auto imu_data = loadImuData(imu_file);
-    for (const auto& [imu_ts_ns, gyro, accel, quat] : imu_data) {
-        sensor_msgs::Imu imu_msg;
-        imu_msg.header.stamp = ros::Time(imu_ts_ns / 1000000000ULL, imu_ts_ns % 1000000000ULL);
-        imu_msg.header.frame_id = "imu";
+    if (!imu_data.empty())
+    {
+        for (const auto& [imu_ts_ns, gyro, accel, quat] : imu_data) {
+            sensor_msgs::Imu imu_msg;
+            imu_msg.header.stamp = ros::Time(imu_ts_ns / 1000000000ULL, imu_ts_ns % 1000000000ULL);
+            imu_msg.header.frame_id = "imu";
 
-        imu_msg.angular_velocity.x = gyro.x();
-        imu_msg.angular_velocity.y = gyro.y();
-        imu_msg.angular_velocity.z = gyro.z();
+            imu_msg.angular_velocity.x = gyro.x();
+            imu_msg.angular_velocity.y = gyro.y();
+            imu_msg.angular_velocity.z = gyro.z();
 
-        imu_msg.linear_acceleration.x = accel.x();
-        imu_msg.linear_acceleration.y = accel.y();
-        imu_msg.linear_acceleration.z = accel.z();
+            imu_msg.linear_acceleration.x = accel.x();
+            imu_msg.linear_acceleration.y = accel.y();
+            imu_msg.linear_acceleration.z = accel.z();
 
-        // 设置姿态四元数 (w, x, y, z)
-        imu_msg.orientation.w = quat.x();  // w
-        imu_msg.orientation.x = quat.y();  // x
-        imu_msg.orientation.y = quat.z();  // y
-        imu_msg.orientation.z = quat.w();  // z
+            // 设置姿态四元数 (w, x, y, z)
+            imu_msg.orientation.w = quat.x();  // w
+            imu_msg.orientation.x = quat.y();  // x
+            imu_msg.orientation.y = quat.z();  // y
+            imu_msg.orientation.z = quat.w();  // z
 
-        imu_msg.angular_velocity_covariance.fill(0.0);
-        imu_msg.linear_acceleration_covariance.fill(0.0);
+            imu_msg.angular_velocity_covariance.fill(0.0);
+            imu_msg.linear_acceleration_covariance.fill(0.0);
 
-        imu_msg.orientation_covariance.fill(0.0); 
+            imu_msg.orientation_covariance.fill(0.0); 
 
-        bag.write("/imu/", imu_msg.header.stamp, imu_msg);
+            bag.write("/imu/", imu_msg.header.stamp, imu_msg);
+        }
+
+        ROS_INFO("Wrote %zu IMU messages.", imu_data.size());       
     }
-    ROS_INFO("Wrote %zu IMU messages.", imu_data.size());
-
+    else
+    {
+        ROS_WARN("No IMU data loaded.");
+    }
+    
     // ----------------- 2. 写入 ALL DVS EVENTS -----------------
     ROS_INFO("Loading DVS file...");
     std::shared_ptr<dvsense::DvsFileReader> dvs_reader = dvsense::DvsFileReader::createFileReader(dvs_file_path);
     if (!dvs_reader->loadFile()) {
-        ROS_ERROR("Failed to load DVS file: %s", dvs_file_path.c_str());
-        bag.close();
-        return -1;
+        ROS_WARN("Failed to load DVS file: %s", dvs_file_path.c_str());
     }
+    else
+    {
+        ROS_INFO("DVS file loaded.");
+        dvsense::TimeStamp dvs_start, dvs_end;
+        dvs_reader->getStartTimeStamp(dvs_start);
+        dvs_reader->getEndTimeStamp(dvs_end);
+        ROS_INFO("DVS time range: %lu ~ %lu (us)", dvs_start, dvs_end);
 
-    dvsense::TimeStamp dvs_start, dvs_end;
-    dvs_reader->getStartTimeStamp(dvs_start);
-    dvs_reader->getEndTimeStamp(dvs_end);
-    ROS_INFO("DVS time range: %lu ~ %lu (us)", dvs_start, dvs_end);
+        const bool EVENT_TS_IN_MICROSECONDS = true; 
+        const size_t time_step = 50000; // 50 ms
+        const std::string EVENT_TOPIC = "/dvs/events";
 
-    // 假设事件时间戳单位是 **微秒（μs）** —— DVSense 默认
-    const bool EVENT_TS_IN_MICROSECONDS = true;
+        // 记录统计信息
+        size_t total_event_count = 0;
+        size_t chunk_idx = 0;
+        dvsense::TimeStamp current_time = dvs_start;
 
-    // 分块读取所有事件（避免内存爆炸）
-    const size_t CHUNK_SIZE = 1000000; // 每次读 1M 事件
-    dvsense::TimeStamp current_time = dvs_start;
-    size_t total_event_count = 0;
+        ROS_INFO("Starting DVS events conversion. Range: [%lu to %lu]", (uint64_t)dvs_start, (uint64_t)dvs_end);
 
-    // 全局变量用于优化连续时间戳的查找
-    static uint64_t g_last_search_key = 0;
-    static std::map<uint64_t, int64_t>::const_iterator g_last_it;
-
-    while (current_time < dvs_end) {
-        auto events_chunk = dvs_reader->getNTimeEventsGivenStartTimeStamp(current_time, CHUNK_SIZE);
-        if (!events_chunk || events_chunk->empty()) break;
-
-        dvs_msgs::EventArray event_array_msg;
-        event_array_msg.header.frame_id = "dvs";
-        event_array_msg.width = 1280;
-        event_array_msg.height = 720;
-
-        for (const auto& ev : *events_chunk) {
-            dvs_msgs::Event e;
-            e.x = ev.x;
-            e.y = ev.y;
-            e.polarity = ev.polarity;
-            // 应用时间偏移：将相机时间戳转换为系统时间戳
-            uint64_t cam_ts_us = ev.timestamp;
-            int64_t offset = interpolateOffset(sync_offsets, cam_ts_us); // 获取系统时间与相机时间的偏移
-            uint64_t sys_ts_us = cam_ts_us + offset; // 系统时间 = 相机时间 + 偏移
-            
-            if (EVENT_TS_IN_MICROSECONDS) {
-                e.ts = ros::Time(sys_ts_us / 1000000ULL, (sys_ts_us % 1000000ULL) * 1000);
-            } else {
-                e.ts = ros::Time(sys_ts_us / 1000000000ULL, sys_ts_us % 1000000000ULL);
+        while (current_time < dvs_end) {
+            // 1. 安全获取数据包              
+            auto events_chunk = dvs_reader->getNTimeEventsGivenStartTimeStamp(current_time, time_step);
+            // 鲁棒性检查：确保指针有效且包含数据
+            if (!events_chunk || events_chunk->empty()) {
+                ROS_WARN("No more events found or reader returned null at ts: %lu", (uint64_t)current_time);
+                break;
             }
-            event_array_msg.events.push_back(e);
+
+            // 2. 初始化 ROS 消息
+            dvs_msgs::EventArray event_array_msg;
+            event_array_msg.header.frame_id = "dvs";
+            event_array_msg.width = 1280;
+            event_array_msg.height = 720;
+            
+            // 【关键优化：提前预留内存】
+            // 避免 vector 在 push_back 过程中频繁产生内存拷贝开销
+            event_array_msg.events.reserve(events_chunk->size());
+
+            // 追踪本包内的时间戳，用于单调性检查
+            ros::Time last_e_ts(0);
+
+            // 3. 转换事件
+            for (const auto& ev : *events_chunk) {
+                dvs_msgs::Event e;
+                e.x = event_array_msg.width - ev.x;
+                e.y = ev.y;
+                e.polarity = ev.polarity == 1 ? false : true;
+
+                // 应用时间偏移：系统时间 = 相机时间 + 偏移
+                // 务必确保 avg_offset 的单位与 ev.timestamp 一致
+                uint64_t cam_ts = ev.timestamp;
+                uint64_t sys_ts = cam_ts + avg_offset; 
+                
+                if (EVENT_TS_IN_MICROSECONDS) {
+                    // 微秒转 ros::Time (秒, 纳秒)
+                    e.ts = ros::Time(sys_ts / 1000000ULL, (sys_ts % 1000000ULL) * 1000ULL);
+                } else {
+                    // 假设为纳秒
+                    e.ts = ros::Time(sys_ts / 1000000000ULL, sys_ts % 1000000000ULL);
+                }
+
+                event_array_msg.events.push_back(e);
+                last_e_ts = e.ts;
+            }
+
+            // 4. 写入 Rosbag
+            if (!event_array_msg.events.empty()) {
+                // 使用该包最后一个事件的时间作为 Header 时间戳
+                event_array_msg.header.stamp = event_array_msg.events.front().ts;
+                
+                try {
+                    // 写入时使用 header.stamp，这对离线处理非常重要
+                    bag.write(EVENT_TOPIC, event_array_msg.header.stamp, event_array_msg);
+                } catch (const std::exception& ex) {
+                    ROS_ERROR("Failed to write to bag: %s", ex.what());
+                    break;
+                }
+
+                total_event_count += event_array_msg.events.size();
+            }
+
+            // 5. 更新下一次迭代的时间戳
+            dvsense::TimeStamp last_ts_in_chunk = events_chunk->back().timestamp;
+            current_time = last_ts_in_chunk + 1;
         }
 
-        // 使用最后一个事件的时间作为 chunk 时间戳（或第一个）
-        if (!event_array_msg.events.empty()) {
-            event_array_msg.header.stamp = event_array_msg.events.back().ts;
-            bag.write("/dvs/events", event_array_msg.header.stamp, event_array_msg);
-            total_event_count += event_array_msg.events.size();
-        }
-
-        // 更新 current_time：取最后一个事件时间 + 1
-        current_time = events_chunk->back().timestamp + 1;
+        ROS_INFO("Finished! Wrote %zu events to topic %s.", total_event_count, EVENT_TOPIC.c_str());
     }
-    ROS_INFO("Wrote %zu DVS events in chunks.", total_event_count);
 
     // ----------------- 3. 写入 ALL IMAGES -----------------
     ROS_INFO("Loading image files...");
@@ -289,15 +340,12 @@ int main(int argc, char *argv[])
             std::string stem = filename.substr(0, filename.size() - 4);
             if (isAllDigits(stem)) {
                 uint64_t cam_img_ts = std::stoull(stem); // 图像的相机时间戳
-                int64_t img_offset = interpolateOffset(sync_offsets, cam_img_ts); // 获取时间偏移
-                uint64_t sys_img_ts = cam_img_ts + img_offset; // 转换为系统时间戳
+                uint64_t sys_img_ts = cam_img_ts + avg_offset; // 转换为系统时间戳
                 timestamped_images.emplace_back(sys_img_ts, filepath); // 存储系统时间戳
             }
         }
     }
     std::sort(timestamped_images.begin(), timestamped_images.end());
-
-    const bool IMG_TS_IN_NANOSECONDS = false; 
 
     for (const auto& [img_ts, img_path] : timestamped_images) {
         cv::Mat img = cv::imread(img_path, cv::IMREAD_COLOR);
@@ -309,7 +357,7 @@ int main(int argc, char *argv[])
         sensor_msgs::ImagePtr img_msg = cv_bridge::CvImage(
             std_msgs::Header(), "bgr8", img
         ).toImageMsg();
-        img_msg->header.stamp = toRosTime(img_ts, IMG_TS_IN_NANOSECONDS);
+        img_msg->header.stamp = toRosTime(img_ts, false);
         img_msg->header.frame_id = "camera";
         bag.write("/camera/image_raw", img_msg->header.stamp, img_msg);
     }

@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 set(CMAKE_CXX_STANDARD 17)
 
 # 设置默认构建类型为Debug
+#set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_BUILD_TYPE Release)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
@@ -47,12 +48,4 @@ PRIVATE
     DvsenseDriver::Driver
 )
 
-# 5. 自定义拷贝逻辑（保持不变）
-add_custom_target(copy_executable
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_FILE:dvtorosbag>
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/
-    DEPENDS dvtorosbag
-)
-
-add_custom_target(default ALL DEPENDS dvtorosbag copy_executable)
+add_executable_copy(dvtorosbag ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/)

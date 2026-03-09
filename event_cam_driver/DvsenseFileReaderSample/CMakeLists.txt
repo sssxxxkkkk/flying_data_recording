@@ -17,11 +17,4 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 
-add_custom_target(copy_executable
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_FILE:dvsense_file_reader>
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../launch/
-    DEPENDS dvsense_file_reader
-)
-
-add_custom_target(default ALL DEPENDS dvsense_file_reader copy_executable)
+add_executable_copy(dvsense_file_reader ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/)

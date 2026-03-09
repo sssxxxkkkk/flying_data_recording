@@ -2,7 +2,14 @@ cmake_minimum_required(VERSION 3.10)
 set(CMAKE_CXX_STANDARD 20)
 project(dvsense_fusion_sync_recorder)
 set(CMAKE_BUILD_TYPE Debug)
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O3")
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+# 添加调试选项
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g -O0")
+
 # set(CMAKE_BUILD_TYPE Release)  # 改为Release模式以启用优化
 # set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG") 
 
@@ -63,11 +70,4 @@ target_include_directories(dvsense_recorder
         ./
 )
 
-add_custom_target(copy_executable
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_FILE:dvsense_recorder>
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../launch/
-    DEPENDS dvsense_recorder
-)
-
-add_custom_target(default ALL DEPENDS dvsense_recorder copy_executable)
+add_executable_copy(dvsense_recorder ${CMAKE_CURRENT_SOURCE_DIR}/../../launch/)
