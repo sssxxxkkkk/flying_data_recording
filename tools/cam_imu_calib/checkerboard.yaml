@@ -1,0 +1,6 @@
+target_type: 'checkerboard'
+targetCols: 7    # 9格-1 = 8个内部角点
+targetRows: 6    # 7格-1 = 6个内部角点  
+rowSpacingMeters: 0.05    # 15mm
+colSpacingMeters: 0.05   # 15mm
+

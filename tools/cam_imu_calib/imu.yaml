@@ -1,0 +1,10 @@
+#IMU configuration for WIT sensor
+accelerometer_noise_density: 5.317465202714886e-04   # Noise density (continuous-time). 单位: m/s^2/sqrt(Hz)
+accelerometer_random_walk:   2.2070113452408245e-05  # Bias random walk. 单位: m/s^2/sqrt(Hz) 
+
+gyroscope_noise_density:     4.901049981691247e-03    # Noise density (continuous-time). 单位: rad/s/sqrt(Hz) 
+gyroscope_random_walk:       5.244114824188137e-05    # Bias random walk. 单位: rad/s/sqrt(Hz) 
+
+rostopic: /imu/
+update_rate: 200.0   
+

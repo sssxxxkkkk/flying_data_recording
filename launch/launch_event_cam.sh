@@ -32,7 +32,7 @@ echo "Started Yesense Main."
 
 # 启动 dvsense_recorder，通过管道接收退出指令 'q'
 # tail -f 会持续保持打开状态，直到被 pkill
-( tail -f $FIFO_PATH ) | sudo ./dvsense_recorder 1 1 > $LOG_DIR/dvsense.log 2>&1 &
+( tail -f $FIFO_PATH ) | sudo ./dvsense_recorder 1 1 192.168.2.16 5000 > $LOG_DIR/dvsense.log 2>&1 &
 echo "Started DVsense Recorder (with command pipe)."
 
 echo "---------------------------------------"

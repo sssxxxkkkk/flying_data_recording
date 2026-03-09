@@ -25,6 +25,7 @@ int main(int argc, char *argv[])
 
     // ----------------- Default parameters -----------------
     bool save_images = true;   // 默认存储照片
+    bool save_events = true;
     bool udp_display = true;    // 默认进行UDP显示
     std::string dest_ip = "192.168.10.1";
     int dest_port = 5000;
@@ -33,8 +34,9 @@ int main(int argc, char *argv[])
     // ----------------- Parse command line arguments -----------------
     if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help"))
     {
-        std::cout << "Usage: " << argv[0] << " [save_images] [udp_display] [dest_ip] [dest_port]" << std::endl;
-        std::cout << "  save_images: 0 or 1 (default: 0 - don't save images)" << std::endl;
+        std::cout << "Usage: " << argv[0] << " [save_images] [save_events] [udp_display] [dest_ip] [dest_port]" << std::endl;
+        std::cout << "  save_images: 0 or 1 (default: 1 - save images)" << std::endl;
+        std::cout << "  save_events: 0 or 1 (default: 1 - save events)" << std::endl;
         std::cout << "  udp_display: 0 or 1 (default: 1 - enable UDP display)" << std::endl;
         std::cout << "  dest_ip: destination IP address (default: 192.168.10.1)" << std::endl;
         std::cout << "  dest_port: destination port (default: 5000)" << std::endl;
@@ -51,31 +53,42 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Parse udp_display flag (argv[2])
-    if (argc > 2) {
+    // Parse save_images flag (argv[2])
+    if (argc > 1) {
         try {
-            udp_display = (std::stoi(argv[2]) != 0);
+            save_events = (std::stoi(argv[2]) != 0);
+        } catch (...) {
+            std::cerr << "Invalid save_events parameter. Using default: " << save_events << std::endl;
+        }
+    }
+
+
+    // Parse udp_display flag (argv[3])
+    if (argc > 3) {
+        try {
+            udp_display = (std::stoi(argv[3]) != 0);
         } catch (...) {
             std::cerr << "Invalid udp_display parameter. Using default: " << udp_display << std::endl;
         }
     }
 
-    // Parse dest_ip (argv[3])
-    if (argc > 3) {
-        dest_ip = argv[3];
+    // Parse dest_ip (argv[4])
+    if (argc > 4) {
+        dest_ip = argv[4];
     }
 
-    // Parse dest_port (argv[4])
-    if (argc > 4) {
+    // Parse dest_port (argv[5])
+    if (argc > 5) {
         try {
-            dest_port = std::stoi(argv[4]);
+            dest_port = std::stoi(argv[5]);
         } catch (...) {
-            std::cerr << "Invalid port number: " << argv[4] << ". Using default port " << dest_port << std::endl;
+            std::cerr << "Invalid port number: " << argv[5] << ". Using default port " << dest_port << std::endl;
         }
     }
 
     std::cout << "Configuration:" << std::endl;
     std::cout << "  Save images: " << (save_images ? "YES" : "NO") << std::endl;
+    std::cout << "  Save events: " << (save_events ? "YES" : "NO") << std::endl;
     std::cout << "  UDP display: " << (udp_display ? "YES" : "NO") << std::endl;
     std::cout << "  Destination IP: " << dest_ip << std::endl;
     std::cout << "  Destination port: " << dest_port << std::endl;
@@ -158,8 +171,12 @@ int main(int argc, char *argv[])
 
 			camera->start();
 		}
-
-		camera->startRecording(recorder.file_path_events_, "events", dvsense::DVS_STREAM);
+                 
+                if(save_events)
+                {
+                   camera->startRecording(recorder.file_path_events_, "events", dvsense::DVS_STREAM);
+                }
+		
 	    //camera->startRecording(recorder.file_path_events_, "events");
 
 		std::string input_command;
