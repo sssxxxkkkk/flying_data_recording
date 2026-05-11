@@ -1,17 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
-set(CMAKE_CXX_STANDARD 20)
+
 project(dvsense_fusion_sync_recorder)
-set(CMAKE_BUILD_TYPE Debug)
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Debug)
-endif()
 
-# 添加调试选项
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
-set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g -O0")
-
-# set(CMAKE_BUILD_TYPE Release)  # 改为Release模式以启用优化
-# set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG") 
 
 # 添加OpenMP支持检查
 find_package(OpenMP QUIET)
@@ -29,13 +19,10 @@ endif()
 add_definitions(-D NOMINMAX)
 
 
-# 告诉 CMake 优先查找 /usr/local 下的库（避免找到系统高版本）
-list(APPEND CMAKE_PREFIX_PATH "/usr/local")
+# 查找 fmt
+find_package(fmt REQUIRED)
 
-# 查找 fmt v6.2.1（必须 exact，防止找到 v8/v9）
-find_package(fmt 6.2.1 EXACT REQUIRED)
-
-# 查找 spdlog（它会自动找到你编译的 v1.8.5 + fmt v6）
+# 查找 spdlog
 find_package(spdlog REQUIRED)
 
 # 查找其他依赖
@@ -70,4 +57,4 @@ target_include_directories(dvsense_recorder
         ./
 )
 
-add_executable_copy(dvsense_recorder ${CMAKE_CURRENT_SOURCE_DIR}/../../launch/)
+

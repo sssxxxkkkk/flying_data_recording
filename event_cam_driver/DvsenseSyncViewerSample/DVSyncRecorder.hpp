@@ -156,7 +156,7 @@ private:
                 lock.unlock();
                 
                 // 保存图像到文件
-                uint64_t exposure_timestamp = frame.exposure_end_timestamp;
+                uint64_t exposure_timestamp = frame.exposure_start_timestamp;
                 std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
                 
                 cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());

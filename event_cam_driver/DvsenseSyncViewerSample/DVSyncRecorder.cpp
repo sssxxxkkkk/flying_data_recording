@@ -1,11 +1,3 @@
-#include <condition_variable>
-#include "DvsenseDriver/camera/FusionCamera.hpp"
-#include "DvsenseDriver/camera/DvsCameraManager.hpp"
-#include <opencv2/opencv.hpp>
-#include "DvsenseBase/logging/logger.hh"
-#include "DvsenseDriver/DataProcess/DvsApsFusionProccessor.hpp"
-#include "DvsenseDriver/Calibration/Calibrator.hpp"
-#include "DvsenseBase/Utils/Json/JsonUtils.hpp"
 #include <thread>
 #include <chrono>
 #include <fstream>
@@ -61,7 +53,6 @@ int main(int argc, char *argv[])
             std::cerr << "Invalid save_events parameter. Using default: " << save_events << std::endl;
         }
     }
-
 
     // Parse udp_display flag (argv[3])
     if (argc > 3) {
@@ -139,18 +130,6 @@ int main(int argc, char *argv[])
 			// Open the first camera found
 			camera = cameraManager.openFusionCamera(open_camera_serial);
 
-			// 设置事件触发阈值
-			std::shared_ptr<dvsense::CameraTool> bias = camera->getTool(dvsense::ToolType::TOOL_BIAS);
-			std::shared_ptr<dvsense::CameraTool> aps = camera->getTool(dvsense::ToolType::TOOL_APS_CTRL);
-            //const std::vector<dvsense::ToolInfo> tools = camera->getAllToolsInfo();
-			// bool ret = bias->setParam("bias_diff_on", 30);
-			// ret = bias->setParam("bias_diff_off", 30);
-            bool ret;
-			ret = aps->setParam("auto_exposure", false);
-			ret = aps->setParam("exposure_time", 15000);
-			//ret = aps->setParam("auto_gain", false);
-			//ret = aps->setParam("gain", 10.0);
-
 			dvsense::CalibratorParameters cali_param;
 			if(camera->readCalibrationParam(cali_param))
 			{
@@ -158,7 +137,7 @@ int main(int argc, char *argv[])
 				calibrator.loadCalibrationParam(cali_param);
 				recorder.compute_remap(cali_param);
 			}
-			
+
 			camera->addApsFrameCallback([&recorder](const dvsense::ApsFrame frame)
 										{ recorder.save_images(frame); });
 
@@ -166,16 +145,57 @@ int main(int argc, char *argv[])
 			// 									  { recorder.save_events(begin, end); });
 			camera->addSyncSignalCallback([&recorder](const dvsense::EventTriggerIn &trigger_in)
 					{ recorder.update_delta_t(trigger_in);});
-			camera->setStatisticInfoCallback([&statistic_info](const dvsense::DsStatisticInfo info)
-											 { statistic_info = info; });
+			// camera->setStatisticInfoCallback([&statistic_info](const dvsense::DsStatisticInfo info)
+			// 								 { statistic_info = info; });
+
+
+            // 设置事件触发阈值
+			std::shared_ptr<dvsense::CameraTool> bias = camera->getTool(dvsense::ToolType::TOOL_BIAS);
+			std::shared_ptr<dvsense::CameraTool> aps = camera->getTool(dvsense::ToolType::TOOL_APS_CTRL);
+			const std::vector<dvsense::ToolInfo> tools = camera->getAllToolsInfo();
+			bool ret;
+			ret = aps->setParam("auto_exposure", false);
+			if (!ret) {
+				LOG_ERROR("Failed to set auto_exposure");
+			}
+			ret = aps->setParam("auto_gain", true);
+			if (!ret) {
+				LOG_ERROR("Failed to set auto_gain");
+			}
+
 
 			camera->start();
+            
+			std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+			
+			ret = aps->setParam("exposure_time", 5000);
+			if (!ret) {
+				LOG_ERROR("Failed to set exposure_time");
+			}
+
+			int value;
+			ret = aps->getParam("exposure_time", value);
+			LOG_INFO("exposure_time: %d", value);
+
+			float gain;
+			ret = aps->getParam("gain", gain);
+			LOG_INFO("gain: %f", gain);
+
+			bool auto_exposure;
+			ret = aps->getParam("auto_exposure", auto_exposure);
+			LOG_INFO("auto_exposure: %d", auto_exposure);
+
+			bool auto_gain;
+			ret = aps->getParam("auto_gain", auto_gain);
+			LOG_INFO("auto_gain: %d", auto_gain);
 		}
-                 
-                if(save_events)
-                {
-                   camera->startRecording(recorder.file_path_events_, "events", dvsense::DVS_STREAM);
-                }
+        
+
+		if(save_events)
+		{
+			camera->startRecording(recorder.file_path_events_, "events", dvsense::DVS_STREAM);
+		}
 		
 	    //camera->startRecording(recorder.file_path_events_, "events");
 

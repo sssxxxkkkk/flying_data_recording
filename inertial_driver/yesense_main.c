@@ -11,6 +11,7 @@
 #include     <getopt.h>
 #include     "analysis_data.h"
 #include     <bits/time.h>
+#include     <bits/time.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -18,6 +19,8 @@
 #else
 #define MKDIR(path) mkdir(path, 0777)
 #endif
+
+#define DEG2RAD (3.14159265358979323846 / 180.0)
 
 // 辅助函数：递归创建目录
 void create_directories(const char *file_path) {
@@ -78,8 +81,9 @@ int main(int argc, char **argv)
     int num=0;
 
     speed_t speed = B921600;
+    dev = "/dev/ttyACM0";
     //speed_t speed = B460800;
-    dev = "/dev/wheeltec_IMU";	
+    //dev = "/dev/wheeltec_IMU";	
     fd = open(dev, O_RDWR | O_NONBLOCK| O_NOCTTY | O_NDELAY); 
     if (fd < 0)	
     {
@@ -169,9 +173,9 @@ int main(int argc, char **argv)
                     num,
                     g_output_info.ts.tv_sec, 
                     g_output_info.ts.tv_nsec,
-                    g_output_info.angle_rate.x,
-                    g_output_info.angle_rate.y,
-                    g_output_info.angle_rate.z,
+                    g_output_info.angle_rate.x * DEG2RAD,
+                    g_output_info.angle_rate.y * DEG2RAD,
+                    g_output_info.angle_rate.z * DEG2RAD,
                     g_output_info.accel.x,
                     g_output_info.accel.y,
                     g_output_info.accel.z,

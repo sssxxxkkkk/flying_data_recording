@@ -24,7 +24,7 @@
         {
             "label": "cmake-build",
             "type": "shell",
-            "command": "cd ${workspaceFolder}/build && cmake .. && make",
+            "command": "cd ${workspaceFolder}/build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make",
             "group": "build",
             "presentation": {
                 "echo": true,
