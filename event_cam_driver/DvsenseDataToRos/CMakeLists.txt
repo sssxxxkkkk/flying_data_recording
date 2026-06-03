@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.10)
 
 project(dvsense_to_rosbag)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 # 1. 查找 ROS 基础包和相关消息包
 find_package(catkin REQUIRED COMPONENTS
     roscpp

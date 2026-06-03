@@ -1,91 +1,158 @@
-import pandas as pd
-import numpy as np
+import sys
 
-def calculate_timestamp_diffs(input_file, output_file=None):
-    """
-    计算相机时间戳、系统时间戳、delta_t与前一帧的差值
-    
-    参数:
-        input_file: 输入文件路径，每行格式为 "cam_timestamp system_time delta_t"
-    """
-    # 读取数据
-    data = []
-    with open(input_file, 'r') as f:
-            # 跳过第一行（标题行）
-            next(f)  # 跳过标题行 "cam_timestamp system_time delta_t"
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = list(map(int, line.split()))
-                if len(parts) != 3:
-                    print(f"警告: 无效行格式，跳过: {line}")
-                    continue
-                data.append(parts)
-    
-    if not data:
-        print("错误: 文件中没有有效数据")
-        return
-    
-    # 转换为DataFrame方便处理
-    df = pd.DataFrame(data, columns=['cam_timestamp', 'system_time', 'delta_t'])
-    
-    # 计算与前一帧的差值
-    df['cam_diff'] = df['cam_timestamp'].diff().fillna(0)
-    df['system_diff'] = df['system_time'].diff().fillna(0)
-    df['delta_diff'] = df['delta_t'].diff().fillna(0)
-    
-    # 计算统计信息
-    stat_info = {
-        "相机间隔均值(μs)": df['cam_diff'][1:].mean(),
-        "相机间隔标准差(μs)": df['cam_diff'][1:].std(),
-        "系统间隔均值(μs)": df['system_diff'][1:].mean(),
-        "系统间隔标准差(μs)": df['system_diff'][1:].std(),
-        "delta_t均值(μs)": df['delta_diff'][1:].mean(),
-        "delta_t标准差(μs)": df['delta_diff'][1:].std()
-    }
-    
-    # 打印结果
-    print("="*80)
-    print("\n时间戳差值计算结果:")
-    print(df[['cam_diff', 'system_diff', 'delta_diff']].to_string(index=False))
-    print("\n统计信息:")
-    for key, value in stat_info.items():
-        print(f"{key}: {value:.2f}")
-    print("\n" + "="*80)
-    
-    
-    return df, stat_info
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
 
-def analyze_time_jitter(df, threshold=10000):
-    """
-    分析系统时间戳抖动情况
-    
-    参数:
-        df: 包含diff数据的DataFrame
-        threshold: 认为是异常抖动的阈值(μs)
-    """
-    print("\n时间戳抖动分析:")
-    
-    # 找出异常大的系统间隔
-    abnormal = df[df['system_diff'] > threshold]
-    if not abnormal.empty:
-        print(f"\n检测到 {len(abnormal)} 个异常大的系统间隔 (> {threshold}μs):")
-        for idx, row in abnormal.iterrows():
-            print(f"行#{idx+1}: {row['system_diff']:.0f}μs, 相机间隔: {row['cam_diff']:.0f}μs")
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
+
+def load_data(filepath):
+    """Read data file, return cam, sys, delta as lists of ints"""
+    cam = []
+    sys_ts = []
+    delta = []
+    with open(filepath, 'r') as f:
+        header = f.readline()  # skip header line
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            c = int(parts[0])
+            s = int(parts[1])
+            d = int(parts[2])
+            cam.append(c)
+            sys_ts.append(s)
+            delta.append(d)
+    return cam, sys_ts, delta
+
+def stats(arr):
+    """Return a dict: sample count, mean, std, min, max, coefficient of variation (%)"""
+    if _HAS_NUMPY:
+        a = np.array(arr, dtype=np.float64)
+        n = len(a)
+        if n < 2:
+            return {'n': n, 'mean': float(a[0]) if n == 1 else 0, 'std': 0,
+                    'min': float(a[0]) if n == 1 else 0, 'max': float(a[0]) if n == 1 else 0, 'cv%': 0}
+        mean = np.mean(a)
+        std = np.std(a, ddof=1)  # sample standard deviation
+        minv = np.min(a)
+        maxv = np.max(a)
+        cv = (std / mean * 100) if mean != 0 else 0.0
+        return {'n': n, 'mean': mean, 'std': std, 'min': minv, 'max': maxv, 'cv%': cv}
     else:
-        print(f"所有系统间隔均在阈值 {threshold}μs 以内")
-    
-    # 分析间隔模式(检测双峰分布)
-    system_diffs = df['system_diff'].values[1:]
-    if len(system_diffs) < 10:
+        n = len(arr)
+        if n == 0:
+            return {'n': 0, 'mean': 0, 'std': 0, 'min': 0, 'max': 0, 'cv%': 0}
+        mean = sum(arr) / n
+        if n == 1:
+            return {'n': n, 'mean': mean, 'std': 0, 'min': arr[0], 'max': arr[0], 'cv%': 0}
+        var = sum((x - mean) ** 2 for x in arr) / (n - 1)
+        std = var ** 0.5
+        minv = min(arr)
+        maxv = max(arr)
+        cv = (std / mean * 100) if mean != 0 else 0.0
+        return {'n': n, 'mean': mean, 'std': std, 'min': minv, 'max': maxv, 'cv%': cv}
+
+def main(filepath):
+    cam, sys_ts, delta = load_data(filepath)
+    if len(cam) < 2:
+        print("Insufficient data points, cannot compute differences.")
         return
-    
 
-# 示例使用
-if __name__ == "__main__":
-    import sys
+    # 1. Camera timestamp differences (frame interval)
+    cam_diff = [cam[i+1] - cam[i] for i in range(len(cam)-1)]
+    # 2. System timestamp differences
+    sys_diff = [sys_ts[i+1] - sys_ts[i] for i in range(len(sys_ts)-1)]
+    # 3. Original delta_t (latency)
+    delta_vals = delta  # use the third column directly
 
-    input_file = "../save_data/event_data/sync_signal.txt"
-    df, stats = calculate_timestamp_diffs(input_file)
-    analyze_time_jitter(df)
+    # Print statistics
+    def print_stats(name, data, unit="ticks"):
+        s = stats(data)
+        print(f"--- {name} (unit: {unit}) ---")
+        print(f"  Samples: {s['n']}")
+        print(f"  Mean:   {s['mean']:.2f}")
+        print(f"  Std Dev: {s['std']:.2f}")
+        print(f"  Min:    {s['min']:.2f}")
+        print(f"  Max:    {s['max']:.2f}")
+        if s['cv%'] is not None:
+            print(f"  CV:     {s['cv%']:.2f}%")
+        print()
+
+    print("=" * 50)
+    print(f"Total frames: {len(cam)}")
+    print("=" * 50)
+
+    print_stats("Camera frame interval (cam_timestamp diff)", cam_diff)
+    print_stats("System receive interval (system_time diff)", sys_diff)
+    print_stats("Latency (delta_t = system_time - cam_timestamp)", delta_vals)
+
+    # 4. Latency drift analysis: linear regression on delta_t to check for monotonic drift
+    print("--- Latency drift analysis ---")
+    if _HAS_NUMPY:
+        x = np.arange(len(delta_vals))
+        y = np.array(delta_vals, dtype=np.float64)
+        A = np.vstack([x, np.ones_like(x)]).T
+        m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        drift_per_frame = m
+        total_drift = m * (len(delta_vals) - 1)
+        print(f"  Drift per frame: {drift_per_frame:.4f} ticks")
+        print(f"  Total drift: {total_drift:.2f} ticks (fitted change from first to last frame)")
+        # Calculate coefficient of determination R²
+        y_mean = np.mean(y)
+        ss_tot = np.sum((y - y_mean) ** 2)
+        ss_res = np.sum((y - (m * x + c)) ** 2)
+        r_squared = 1 - ss_res / ss_tot if ss_tot != 0 else 0
+        print(f"  R² (goodness of fit): {r_squared:.4f}")
+    else:
+        # Simple head/tail difference as reference
+        total_change = delta_vals[-1] - delta_vals[0]
+        per_frame_change = total_change / (len(delta_vals) - 1) if len(delta_vals) > 1 else 0
+        print(f"  Head-tail difference: {total_change} ticks")
+        print(f"  Avg change per frame: {per_frame_change:.4f} ticks")
+    print("=" * 50)
+
+    # ========== Histogram of delta_t deviation from mean ==========
+    if not _HAS_NUMPY or not _HAS_MATPLOTLIB:
+        print("numpy or matplotlib not installed, cannot plot histogram.")
+        return
+
+    # Compute deviation (delta_t - mean delta_t)
+    delta_mean = np.mean(delta_vals)
+    offsets = np.array(delta_vals) - delta_mean
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(offsets, bins=50, edgecolor='black', alpha=0.7)
+    plt.axvline(x=0, color='red', linestyle='--', linewidth=1.5,
+                label=f'Mean deviation = 0 (avg Δ = {delta_mean:.2f} µs)')
+    plt.xlabel('delta_t deviation (µs)', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.title('Distribution of delta_t deviation from mean', fontsize=14)
+    plt.grid(axis='y', alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    # Save the figure as PNG, naming based on input file
+    import os
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    out_img = f"{base}_delta_offset_histogram.png"
+    plt.savefig(out_img, dpi=150)
+    print(f"Histogram saved as: {out_img}")
+
+    # Optionally display the plot window (may fail in headless environments, comment out if needed)
+    # plt.show()
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print("Usage: python analyze_timestamps.py <data_file.txt>")
+        sys.exit(1)
+    main(sys.argv[1])

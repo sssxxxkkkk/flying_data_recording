@@ -13,6 +13,11 @@ fi
 # 确保当前用户和 root 都能读写日志目录
 sudo chmod 777 "$LOG_DIR"
 
+# 3. 准备 dvsense_recorder 的命令命名管道 (FIFO)
+FIFO_PATH="/tmp/dvsense_fifo"
+rm -f $FIFO_PATH  # 先清理旧的
+mkfifo $FIFO_PATH
+chmod 666 $FIFO_PATH # 确保所有用户都能写入该管道
 
 echo "--- Startup Process ---"
 
@@ -26,7 +31,7 @@ sudo sh -c "./yesense_main > $LOG_DIR/yesense.log 2>&1" &
 echo "Started Yesense Main."
 
 # 关键修正：确保参数 1 0 包含在 sh -c 的字符串里
-sudo sh -c "./infrared_driver 1 1 > $LOG_DIR/infrared.log 2>&1" &
+sudo sh -c "./infrared_driver 1 1 192.168.1.123 5000 > $LOG_DIR/infrared.log 2>&1" &
 echo "Started Infrared Driver with Params 1 0."
 
 echo "---------------------------------------"
@@ -39,11 +44,6 @@ sleep 900
 echo "---------------------------------------"
 echo "Time is up! Starting Shutdown Sequence..."
 
-# 6. 安全退出交互式程序 (向管道发送 'q')
-if [ -p "$FIFO_PATH" ]; then
-    echo "Sending 'q' to dvsense_recorder..."
-    echo "q" > $FIFO_PATH
-fi
 
 # 等待 5 秒让程序处理退出逻辑并保存文件
 sleep 5

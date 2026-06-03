@@ -1,11 +1,258 @@
-#include <thread>
-#include <chrono>
-#include <fstream>
-#include <queue>
-#include <filesystem>
 #include "DVSyncRecorder.hpp"
-#include <map>
-#include "DvsenseDriver/camera/DvsCamera.hpp"
+#include <stdexcept>
+#include <cstring>
+#include <iostream>
+#include <chrono>    // 确保 chrono 可用
+
+// ========================= VideoSender =========================
+VideoSender::VideoSender(const std::string& dest_ip, int dest_port, int jpeg_quality)
+    : dest_ip_(dest_ip), dest_port_(dest_port), jpeg_quality_(jpeg_quality)
+{
+    sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd_ < 0) throw std::runtime_error("socket create failed");
+
+    memset(&servaddr_, 0, sizeof(servaddr_));
+    servaddr_.sin_family = AF_INET;
+    servaddr_.sin_port = htons(dest_port_);
+    if (inet_pton(AF_INET, dest_ip.c_str(), &servaddr_.sin_addr) <= 0)
+        throw std::runtime_error("invalid IP");
+
+    struct timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 300000;
+    setsockopt(sockfd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    send_thread_ = std::thread(&VideoSender::sendThreadFunc, this);
+}
+
+VideoSender::~VideoSender() {
+    stop_ = true;
+    queue_cv_.notify_all();
+    if (send_thread_.joinable()) send_thread_.join();
+    close(sockfd_);
+}
+
+void VideoSender::sendFrame(const cv::Mat& frame) {
+    if (frame.empty() || stop_) return;
+    std::lock_guard<std::mutex> lock(queue_mtx_);
+    if (frame_queue_.size() > 15) return;
+    frame_queue_.push(frame.clone());
+    queue_cv_.notify_one();
+}
+
+void VideoSender::sendThreadFunc() {
+    while (!stop_) {
+        std::unique_lock<std::mutex> lock(queue_mtx_);
+        queue_cv_.wait(lock, [this] { return !frame_queue_.empty() || stop_; });
+
+        if (stop_ && frame_queue_.empty()) break;
+        if (frame_queue_.empty()) continue;
+
+        cv::Mat frame = frame_queue_.front();
+        frame_queue_.pop();
+        lock.unlock();
+
+        int w = (frame.cols / 2) & ~1;
+        int h = (frame.rows / 2) & ~1;
+        cv::Mat resized;
+        cv::resize(frame, resized, cv::Size(w, h), 0, 0, cv::INTER_LINEAR);
+
+        buffer_.clear();
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_, cv::IMWRITE_JPEG_OPTIMIZE, 0};
+        cv::imencode(".jpg", resized, buffer_, params);
+
+        sendto(sockfd_, buffer_.data(), buffer_.size(), 0,
+               (struct sockaddr*)&servaddr_, sizeof(servaddr_));
+    }
+}
+
+// ====================== 图像保存线程池 ======================
+ImageSaveThreadPool& ImageSaveThreadPool::instance() {
+    static ImageSaveThreadPool pool;
+    return pool;
+}
+
+ImageSaveThreadPool::ImageSaveThreadPool() {
+    int num = std::min(std::thread::hardware_concurrency(), 4u);
+    for (int i = 0; i < num; ++i) {
+        workers_.emplace_back([this] {
+            while (!stop_) {
+                std::pair<std::string, cv::Mat> task;
+                {
+                    std::unique_lock<std::mutex> lock(mtx_);
+                    cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+                    if (stop_ && tasks_.empty()) return;
+                    task = std::move(tasks_.front());
+                    tasks_.pop();
+                }
+                cv::imwrite(task.first, task.second);
+            }
+        });
+    }
+}
+
+ImageSaveThreadPool::~ImageSaveThreadPool() {
+    stop_ = true;
+    cv_.notify_all();
+    for (auto& t : workers_) if (t.joinable()) t.join();
+}
+
+void ImageSaveThreadPool::enqueue(const std::string& path, const cv::Mat& img) {
+    if (stop_) return;
+    std::lock_guard<std::mutex> lock(mtx_);
+    tasks_.emplace(path, img.clone());
+    cv_.notify_one();
+}
+
+// ====================== DvsenseRecorder ======================
+DvsenseRecorder::DvsenseRecorder(std::string file_path, bool save_images, bool udp_display,
+                                 std::string& dest_ip, int dest_port)
+    : save_images_(save_images), udp_display_(udp_display),
+      dest_ip_(dest_ip), dest_port_(dest_port),
+      v_sender_(dest_ip, dest_port, 85)
+{
+    file_path_ = file_path;
+    file_path_images_ = file_path + "/image_data";
+    file_path_events_ = file_path + "/event_data";
+    sync_filename_ = file_path_events_ + "/sync_signal.txt";
+
+    std::filesystem::create_directories(file_path_images_);
+    std::filesystem::create_directories(file_path_events_);
+
+    for (auto& e : std::filesystem::directory_iterator(file_path_images_))
+        std::filesystem::remove_all(e.path());
+
+    if (std::filesystem::exists(sync_filename_))
+        std::filesystem::remove(sync_filename_);
+
+    sync_file_stream_.open(sync_filename_, std::ios::app);
+    if (sync_file_stream_.is_open())
+        sync_file_stream_ << "cam_timestamp system_time delta_t\n";
+
+    image_thread_ = std::thread(&DvsenseRecorder::processImages, this);
+    sync_thread_ = std::thread(&DvsenseRecorder::processSyncSignals, this);
+}
+
+DvsenseRecorder::~DvsenseRecorder() {
+    stop_worker_ = true;
+    frame_queue_cv_.notify_all();
+    // ★ 不再需要 trigger_queue_cv_.notify_all()
+    if (image_thread_.joinable()) image_thread_.join();
+    if (sync_thread_.joinable()) sync_thread_.join();
+}
+
+void DvsenseRecorder::save_images(const dvsense::ApsFrame frame) {
+    std::lock_guard<std::mutex> lock(frame_queue_mtx_);
+    if (frame_queue_.size() > 30) return;
+    frame_queue_.push(frame);
+    frame_queue_cv_.notify_one();
+}
+
+void DvsenseRecorder::processImages() {
+    // 未修改，同原版
+    while (true) {
+        std::unique_lock<std::mutex> lock(frame_queue_mtx_);
+        frame_queue_cv_.wait(lock, [this] { return !frame_queue_.empty() || stop_worker_; });
+
+        if (stop_worker_ && frame_queue_.empty()) break;
+        if (frame_queue_.empty()) continue;
+
+        auto frame = std::move(frame_queue_.front());
+        frame_queue_.pop();
+        lock.unlock();
+
+        cv::Mat img(frame.height(), frame.width(), CV_8UC3, frame.data());
+        cv::Mat bgr;
+        cv::cvtColor(img, bgr, cv::COLOR_RGB2BGR);
+
+        cv::Mat out;
+        if (is_calibrated_)
+            cv::remap(bgr, out, map_x_, map_y_, cv::INTER_LINEAR);
+        else
+            out = bgr;
+
+        std::string name = file_path_images_ + "/" + std::to_string(frame.exposure_start_timestamp) + ".bmp";
+        if (save_images_)
+            ImageSaveThreadPool::instance().enqueue(name, out);
+
+        if (udp_display_)
+            v_sender_.sendFrame(out);
+    }
+}
+
+// ★ 回调：无锁 push
+void DvsenseRecorder::update_delta_t(const dvsense::EventTriggerIn &trigger_in) {
+    auto sys_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+        
+    SyncTimestamp ts;
+    ts.cam_timestamp = trigger_in.timestamp;
+    ts.system_timestamp = sys_ts;
+    ts.polarity = trigger_in.polarity;
+
+    // 非阻塞 push；若队列满则静默丢弃（容量 4096，几乎不会满）
+    sync_queue_.push(ts);
+}
+
+// ★ 处理线程：无锁 pop + 轮询
+void DvsenseRecorder::processSyncSignals() {
+    SyncTimestamp ts;
+    while (!stop_worker_) {
+        // 一次性取出所有可用的同步信号
+        while (sync_queue_.pop(ts)) {
+            if (ts.polarity == 0 && sync_file_stream_.is_open()) {
+                {
+                    std::lock_guard<std::mutex> d_lock(delta_t_mtx_);
+                    delta_t = ts.system_timestamp - ts.cam_timestamp;
+                }
+                sync_file_stream_ << ts.cam_timestamp << " "
+                                  << ts.system_timestamp << " "
+                                  << delta_t << "\n";
+            }
+        }
+        // 短暂休眠，避免空转占满 CPU
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    // 退出前清空队列中剩余数据
+    while (sync_queue_.pop(ts)) {
+        if (ts.polarity == 0 && sync_file_stream_.is_open()) {
+            {
+                std::lock_guard<std::mutex> d_lock(delta_t_mtx_);
+                delta_t = ts.system_timestamp - ts.cam_timestamp;
+            }
+            sync_file_stream_ << ts.cam_timestamp << " "
+                              << ts.system_timestamp << " "
+                              << delta_t << "\n";
+        }
+    }
+
+    if (sync_file_stream_.is_open()) {
+        sync_file_stream_.close();
+    }
+}
+
+void DvsenseRecorder::compute_remap(dvsense::CalibratorParameters cali_param) {
+    is_calibrated_ = true;
+    int h = cali_param.dvs_rows;
+    int w = cali_param.dvs_cols;
+    auto& m = cali_param.affine_matrix["1"].data;
+
+    map_x_.create(h, w, CV_32FC1);
+    map_y_.create(h, w, CV_32FC1);
+    map_x_.setTo(-1);
+    map_y_.setTo(-1);
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float px = x * m[0] + y * m[1] + m[2];
+            float py = x * m[3] + y * m[4] + m[5];
+            if (px < 0 || px >= cali_param.aps_cols || py < 0 || py >= cali_param.aps_rows) continue;
+            map_x_.at<float>(y, x) = px;
+            map_y_.at<float>(y, x) = py;
+        }
+    }
+}
 
 int main(int argc, char *argv[])
 {
@@ -216,4 +463,4 @@ int main(int argc, char *argv[])
 
 	} while (!stop_application);
 	return 0;
-}
+ }

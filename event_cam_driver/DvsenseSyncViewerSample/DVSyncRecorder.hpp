@@ -2,439 +2,121 @@
 #define DVSYNC_RECORDER_HPP
 
 #include <condition_variable>
-#include "DvsenseDriver/camera/FusionCamera.hpp"
-#include "DvsenseDriver/camera/DvsCameraManager.hpp"
-#include <opencv2/opencv.hpp>
-#include "DvsenseBase/logging/logger.hh"
-#include "DvsenseDriver/DataProcess/DvsApsFusionProccessor.hpp"
-#include "DvsenseDriver/Calibration/Calibrator.hpp"
-#include "DvsenseBase/Utils/Json/JsonUtils.hpp"
+#include <mutex>
 #include <thread>
-#include <chrono>
-#include <fstream>
 #include <queue>
+#include <vector>
+#include <fstream>
 #include <filesystem>
-#include <cstring>
+#include <atomic>
+#include <opencv2/opencv.hpp>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 
+// ★ 新增无锁队列头文件
+#include <boost/lockfree/spsc_queue.hpp>
+
+#include "DvsenseDriver/camera/FusionCamera.hpp"
+#include "DvsenseDriver/camera/DvsCameraManager.hpp"
+#include "DvsenseBase/logging/logger.hh"
+#include "DvsenseDriver/DataProcess/DvsApsFusionProccessor.hpp"
+#include "DvsenseDriver/Calibration/Calibrator.hpp"
+#include "DvsenseBase/Utils/Json/JsonUtils.hpp"
+
+// ====================== 异步 UDP 发送线程 ======================
 class VideoSender {
 public:
-    // 构造函数：初始化UDP连接
-    VideoSender(const std::string& dest_ip, int dest_port, int jpeg_quality = 85)
-        : dest_ip_(dest_ip), dest_port_(dest_port), jpeg_quality_(jpeg_quality) {
-        
-        // 创建UDP Socket
-        sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sockfd_ < 0) {
-            throw std::runtime_error("Failed to create socket");
-        }
-
-        // 配置目标地址
-        memset(&servaddr_, 0, sizeof(servaddr_));
-        servaddr_.sin_family = AF_INET;
-        servaddr_.sin_port = htons(dest_port_);
-        if (inet_pton(AF_INET, dest_ip_.c_str(), &servaddr_.sin_addr) <= 0) {
-            throw std::runtime_error("Invalid destination IP");
-        }
-
-        std::cout << "VideoSender initialized: " << dest_ip_ << ":" << dest_port_ 
-                  << " (JPEG quality: " << jpeg_quality_ << ")" << std::endl;
-    }
-
-    // 发送图像
-    void sendFrame(const cv::Mat& frame) {
-        // 1. 检查输入图像是否为空
-        if (frame.empty()) {
-            std::cerr << "Error: Empty frame (size=" << frame.cols << "x" << frame.rows << ")" << std::endl;
-            return;
-        }
-    
-        // 2. 确保尺寸为偶数（避免缩放错误）
-        int new_width = (frame.cols / 2) & ~1; // 保证偶数
-        int new_height = (frame.rows / 2) & ~1;
-        
-        cv::Mat resized_frame;
-        if (new_width < 1 || new_height < 1) {
-            resized_frame = frame; // 退化到原图
-        } else {
-            cv::resize(frame, resized_frame, cv::Size(new_width, new_height), 
-                      0, 0, cv::INTER_LINEAR);
-        }
-    
-        // 3. 压缩为JPEG（关键：避免每次创建vector）
-        buffer_.clear();
-        cv::imencode(".jpg", resized_frame, buffer_, 
-                     {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_});
-    
-        // 4. 添加发送数据的代码
-        struct timeval timeout;
-        timeout.tv_sec = 0.3;
-        timeout.tv_usec = 0;
-        setsockopt(sockfd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    
-        // 4. 添加发送数据的代码
-        int bytes_sent = sendto(sockfd_, buffer_.data(), buffer_.size(), 0, 
-                              (struct sockaddr*)&servaddr_, sizeof(servaddr_));
-        
-        // 5. 添加发送状态日志
-        if (bytes_sent < 0) {
-            std::cerr << "UDP send failed (errno=" << errno << "): " << strerror(errno) 
-                      << " | Frame size: " << resized_frame.cols << "x" << resized_frame.rows 
-                      << " | JPEG quality: " << jpeg_quality_ << std::endl;
-        } else {
-            std::cout << "Sent frame: " << resized_frame.cols << "x" << resized_frame.rows 
-                      << " (JPG quality: " << jpeg_quality_ << ") | Size: " << buffer_.size() << " bytes" << std::endl;
-        }
-    }
-
-
-    // 析构函数：关闭Socket
-    ~VideoSender() {
-        close(sockfd_);
-    }
+    VideoSender(const std::string& dest_ip, int dest_port, int jpeg_quality = 85);
+    ~VideoSender();
+    void sendFrame(const cv::Mat& frame);
 
 private:
+    void sendThreadFunc();
+
     int sockfd_;
     struct sockaddr_in servaddr_;
     std::string dest_ip_;
     int dest_port_;
     int jpeg_quality_;
-    std::vector<uchar> buffer_; // 重用缓冲区，避免频繁内存分配
+
+    std::thread send_thread_;
+    std::mutex queue_mtx_;
+    std::condition_variable queue_cv_;
+    std::queue<cv::Mat> frame_queue_;
+    std::vector<uchar> buffer_;
+    std::atomic<bool> stop_{false};
 };
 
+// ====================== 图像保存线程池 ======================
+class ImageSaveThreadPool {
+public:
+    static ImageSaveThreadPool& instance();
+    void enqueue(const std::string& path, const cv::Mat& img);
 
+private:
+    ImageSaveThreadPool();
+    ~ImageSaveThreadPool();
+
+    std::vector<std::thread> workers_;
+    std::queue<std::pair<std::string, cv::Mat>> tasks_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::atomic<bool> stop_{false};
+};
+
+// ====================== 主录制器 ======================
 class DvsenseRecorder
 {
+public:
+    uint64_t delta_t = 0;
+    std::string file_path_;
+    std::string file_path_images_;
+    std::string file_path_events_;
+    std::string sync_filename_;
+
+    DvsenseRecorder(std::string file_path, bool save_images, bool udp_display,
+                    std::string& dest_ip, int dest_port);
+    ~DvsenseRecorder();
+
+    void save_images(const dvsense::ApsFrame frame);
+    void update_delta_t(const dvsense::EventTriggerIn &trigger_in);
+    void compute_remap(dvsense::CalibratorParameters cali_param);
+
 private:
+    void processImages();
+    void processSyncSignals();
+
+    // 图像队列（仍用锁 + 条件变量）
     std::queue<dvsense::ApsFrame> frame_queue_;
-    
+    std::mutex frame_queue_mtx_;
+    std::condition_variable frame_queue_cv_;
+
+    // ★ 同步信号改为无锁队列
     struct SyncTimestamp {
         uint64_t cam_timestamp;
         uint64_t system_timestamp;
         int polarity;
     };
+    // 单生产者（回调）单消费者（处理线程），容量 4096
+    boost::lockfree::spsc_queue<SyncTimestamp, boost::lockfree::capacity<4096>> sync_queue_;
 
-    std::queue<SyncTimestamp> trigger_queue_;
-    std::mutex frame_queue_mutex_;
-    std::mutex trigger_queue_mutex_;
-    std::mutex delta_t_mutex_;
-    std::condition_variable frame_queue_cv_;
-    std::condition_variable trigger_queue_cv_;
-    std::thread image_process_thread_;
-    std::thread sync_process_thread_;
-    bool stop_worker_ = false;
-    bool is_calibrated_ = false;
+    std::mutex delta_t_mtx_;           
+    std::thread image_thread_;
+    std::thread sync_thread_;
+    std::atomic<bool> stop_worker_{false};
+
+    bool is_calibrated_{false};
     cv::Mat map_x_, map_y_;
-    
-    //初始化远程发送服务
-    std::string dest_ip = "192.168.10.1";
-    int dest_port = 5000;
-    VideoSender v_sender;
+
+    std::string dest_ip_;
+    int dest_port_;
+    VideoSender v_sender_;
     bool save_images_;
     bool udp_display_;
-    
-    // 同步文件流
+
     std::ofstream sync_file_stream_;
-
-    void process_images() {
-        while (true) {
-            std::unique_lock<std::mutex> lock(frame_queue_mutex_);
-            frame_queue_cv_.wait(lock, [this] { 
-                return !frame_queue_.empty() || stop_worker_; 
-            });
-            
-            if (stop_worker_ && frame_queue_.empty()) {
-                break;
-            }
-            
-            if (!frame_queue_.empty()) {
-                auto frame = std::move(frame_queue_.front());
-                frame_queue_.pop();
-                lock.unlock();
-                
-                // 保存图像到文件
-                uint64_t exposure_timestamp = frame.exposure_start_timestamp;
-                std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
-                
-                cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
-                cv::Mat image_bgr;
-
-                if (is_calibrated_) {
-                    cv::Mat image_rgb;
-                    cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
-                    image_bgr = image_rgb;
-                    //cv::cvtColor(image_rgb, image_bgr, cv::COLOR_RGB2BGR);
-                    if(save_images_)
-                    {
-                      cv::imwrite(image_filename, image_bgr);
-                    }
-                    if(udp_display_)
-                    {
-                      v_sender.sendFrame(image_bgr);
-                    }
-                      
-                } else {
-                    image_bgr = image;
-                    //cv::cvtColor(image, image_bgr, cv::COLOR_RGB2BGR);
-                    if(save_images_)
-                    {
-                      cv::imwrite(image_filename, image_bgr);
-                    }
-                    
-                    if(udp_display_)
-                    {
-                      v_sender.sendFrame(image); 
-                    }
-                     
-                }
-            }
-        }
-        
-        // 处理剩余的图像数据
-        std::lock_guard<std::mutex> final_lock(frame_queue_mutex_);
-        while (!frame_queue_.empty()) {
-            auto frame = std::move(frame_queue_.front());
-            frame_queue_.pop();
-            
-            // 保存图像到文件
-            uint64_t exposure_timestamp = frame.exposure_end_timestamp;
-            std::string image_filename = file_path_images_ + "/" + std::to_string(exposure_timestamp) + ".bmp";
-            
-            cv::Mat image(frame.height(), frame.width(), CV_8UC3, (void*)frame.data());
-            cv::Mat image_bgr;
-
-            if (is_calibrated_) {
-                cv::Mat image_rgb;
-                cv::remap(image, image_rgb, map_x_, map_y_, cv::INTER_LINEAR);
-                image_bgr = image_rgb;
-                if(save_images_)
-                {
-                  cv::imwrite(image_filename, image_bgr);
-                }
-                if(udp_display_)
-                {
-                  v_sender.sendFrame(image_bgr);
-                }
-                  
-            } else {
-                image_bgr = image;
-                if(save_images_)
-                {
-                  cv::imwrite(image_filename, image_bgr);
-                }
-                
-                if(udp_display_)
-                {
-                  v_sender.sendFrame(image); 
-                }
-                 
-            }
-        }
-        
-        std::cout << "图像处理线程退出" << std::endl;
-    }
-    
-    void process_sync_signals() {
-        while (true) {
-            std::unique_lock<std::mutex> lock(trigger_queue_mutex_);
-            trigger_queue_cv_.wait(lock, [this] { 
-                return !trigger_queue_.empty() || stop_worker_; 
-            });
-            
-            if (stop_worker_ && trigger_queue_.empty()) {
-                break;
-            }
-            
-            if (!trigger_queue_.empty()) {
-                auto sync_ts = std::move(trigger_queue_.front());
-                trigger_queue_.pop();
-                lock.unlock();
-                
-                // 记录同步信号到文件
-                if (sync_ts.polarity == 0 && sync_file_stream_.is_open()) {
-                    uint64_t cam_timestamp = sync_ts.cam_timestamp;
-                    uint64_t system_timestamp = sync_ts.system_timestamp;
-
-                    {
-                        std::lock_guard<std::mutex> lock(delta_t_mutex_);
-                        delta_t = system_timestamp - cam_timestamp;
-                    }
-                    
-                    // 写入同步信号信息：相机时间戳 系统时间戳 差值
-                    sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << delta_t << std::endl;
-                    //sync_file_stream_.flush();
-                }
-            }
-        }
-        
-        // 处理剩余的触发信号数据
-        std::lock_guard<std::mutex> final_lock(trigger_queue_mutex_);
-        while (!trigger_queue_.empty()) {
-            auto sync_ts = std::move(trigger_queue_.front());
-            trigger_queue_.pop();
-            
-            // 记录同步信号到文件
-            if (sync_ts.polarity == 0 && sync_file_stream_.is_open()) {
-                uint64_t cam_timestamp = sync_ts.cam_timestamp;
-                uint64_t system_timestamp = sync_ts.system_timestamp;
-                
-                {
-                    std::lock_guard<std::mutex> lock(delta_t_mutex_);
-                    delta_t = system_timestamp - cam_timestamp;
-                }
-                
-                // 写入同步信号信息：相机时间戳 系统时间戳 差值
-                sync_file_stream_ << cam_timestamp << " " << system_timestamp << " " << delta_t << std::endl;
-                //sync_file_stream_.flush();
-            }
-        }
-        
-        if (sync_file_stream_.is_open()) {
-            sync_file_stream_.close();
-        }
-        
-        std::cout << "同步信号处理线程退出" << std::endl;
-    }
-
-public:
-    uint64_t delta_t = 0;      // 相机时间 + delta_t = 系统时间
-    std::string file_path_;
-    std::string file_path_images_;
-    std::string file_path_events_;
-    std::string sync_filename_;
-    
-    DvsenseRecorder(std::string file_path, bool save_images, bool udp_display, std::string& dest_ip, int dest_port ): save_images_(save_images), udp_display_(udp_display), dest_ip(dest_ip), dest_port(dest_port), v_sender(dest_ip, dest_port)
-    {
-        file_path_ = file_path;
-        file_path_images_ = file_path + "/image_data";
-        file_path_events_ = file_path + "/event_data";
-        sync_filename_ = file_path_events_ + "/sync_signal.txt";
-
-        //1. 如果文件夹不存在，则创建
-        if (!std::filesystem::exists(file_path_))
-        {
-            std::filesystem::create_directory(file_path_);
-        }
-
-        if (!std::filesystem::exists(file_path_events_))
-        {
-            std::filesystem::create_directory(file_path_events_);
-        }
-
-        if (!std::filesystem::exists(file_path_images_))
-        {
-            std::filesystem::create_directory(file_path_images_);
-        }
-        else 
-        {
-            // 如果文件夹存在，清空文件夹中的所有内容
-            for (const auto& entry : std::filesystem::directory_iterator(file_path_images_)) 
-            {
-                std::filesystem::remove_all(entry.path());
-            }
-        }
-        
-        if (std::filesystem::exists(sync_filename_)) {
-            std::filesystem::remove(sync_filename_);
-        }
-        
-        // 创建并打开新的同步信号文件
-        sync_file_stream_.open(sync_filename_, std::ios::out | std::ios::app);
-        if(sync_file_stream_.is_open())
-        {
-             sync_file_stream_ << "cam_timestamp" << " " << "system_time" << " " << "delta_t" << std::endl;
-        }
-
-        // 启动两个独立的工作线程
-        image_process_thread_ = std::thread(&DvsenseRecorder::process_images, this);
-        sync_process_thread_ = std::thread(&DvsenseRecorder::process_sync_signals, this);
-    }
-    
-    // 析构函数，清理资源
-    ~DvsenseRecorder() {
-        {
-            std::lock_guard<std::mutex> frame_lock(frame_queue_mutex_);
-            std::lock_guard<std::mutex> trigger_lock(trigger_queue_mutex_);
-            stop_worker_ = true;
-        }
-        frame_queue_cv_.notify_all();
-        trigger_queue_cv_.notify_all();
-        if (image_process_thread_.joinable()) {
-            image_process_thread_.join();
-        }
-        if (sync_process_thread_.joinable()) {
-            sync_process_thread_.join();
-        }
-    }
-    
-
-    // 保存图像
-    void save_images(const dvsense::ApsFrame frame)
-    {
-        // 图像名称为 file_path_images_ + "/" + frame.exposure_end_timestamp + ".bmp"
-
-        // 寻找高效的保存方式
-        // 将图像帧放入队列，由工作线程处理
-        std::lock_guard<std::mutex> lock(frame_queue_mutex_);
-        frame_queue_.push(frame);
-        frame_queue_cv_.notify_one();
-    }
-   
-    // 更新delta_t并记录同步信号
-    void update_delta_t(const dvsense::EventTriggerIn &trigger_in)
-    {
-        // 在接收触发信号时立即获取系统时间戳
-        auto system_time = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-        
-        SyncTimestamp sync_ts;
-        sync_ts.cam_timestamp = trigger_in.timestamp;
-        sync_ts.system_timestamp = system_time;
-        sync_ts.polarity = trigger_in.polarity;
-        
-        // 将触发信号和对应系统时间放入队列，由工作线程处理
-        std::lock_guard<std::mutex> lock(trigger_queue_mutex_);
-
-        trigger_queue_.push(sync_ts);
-        trigger_queue_cv_.notify_one();
-    }
-
-    void compute_remap(dvsense::CalibratorParameters cali_param)
-	{
-	   is_calibrated_ = true;
-	   int dvs_rows = cali_param.dvs_rows;
-	   int dvs_cols = cali_param.dvs_cols;
-	   int aps_rows = cali_param.aps_rows;
-	   int aps_cols = cali_param.aps_cols;
-       std::vector<double> dvs_to_aps_affine_matrix = cali_param.affine_matrix["1"].data;
-	   float offset_x = 0.f;
-       float offset_y = 0.f;
-
-	   //
-	   map_x_.create(dvs_rows, dvs_cols, CV_32FC1); 
-	   map_y_.create(dvs_rows, dvs_cols, CV_32FC1);
-
-	   //
-       for(int y = 0; y < dvs_rows; ++y)
-        {
-            for(int x = 0; x < dvs_cols; ++x)
-            {
-                // Apply affine transformation to map APS pixels to DVS events
-                float aps_x = static_cast<float>(x * dvs_to_aps_affine_matrix[0] + y * dvs_to_aps_affine_matrix[1] + dvs_to_aps_affine_matrix[2] + offset_x);
-                float aps_y = static_cast<float>(x * dvs_to_aps_affine_matrix[3] + y * dvs_to_aps_affine_matrix[4] + dvs_to_aps_affine_matrix[5] + offset_y);
-                if (aps_x < 0 || aps_x >= cali_param.aps_cols || aps_y < 0 || aps_y >= cali_param.aps_rows)
-                {
-                    continue;
-                }
-
-				map_x_.at<float>(y, x) = aps_x;
-				map_y_.at<float>(y, x) = aps_y;
-            }
-        }
-	};
 };
 
-#endif // DVSYNC_RECORDER_HPP
+#endif

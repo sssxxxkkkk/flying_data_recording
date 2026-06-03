@@ -1,502 +1,653 @@
+import re
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+
 from matplotlib.animation import FuncAnimation
 from scipy.spatial.transform import Rotation as R
-import re
 from scipy.spatial.transform import Slerp
-import cv2
-from scipy.signal import correlate
+from scipy.signal import correlate, savgol_filter
 from scipy.ndimage import gaussian_filter1d
-def parse_uav_data(file_path):
-    """解析 UAV 数据: R_UAV_W (Body to World)"""
+
+
+def is_valid_rotation_matrix(R_mat, tolerance=1e-6):
+    """
+    Check whether a matrix is a valid rotation matrix.
+    """
+    R_mat = np.asarray(R_mat, dtype=np.float64)
+
+    if R_mat.shape != (3, 3):
+        return False
+
+    orthogonal_error = np.linalg.norm(R_mat.T @ R_mat - np.eye(3))
+    determinant_error = abs(np.linalg.det(R_mat) - 1.0)
+
+    return orthogonal_error < tolerance and determinant_error < tolerance
+
+
+def rotation_angle_deg(R_mat):
+    """
+    Convert rotation matrix error to angle in degrees.
+    """
+    return np.degrees(R.from_matrix(R_mat).magnitude())
+
+
+def parse_uav_data(file_path, output_frame="dji"):
+    """
+    Parse DJI UAV quaternion data and return body-to-world rotation.
+
+    DJI PSDK quaternion convention:
+        q0, q1, q2, q3 = w, x, y, z
+
+    DJI attitude meaning (Confirmed by Hand-Eye Calibration):
+        World: NED
+        Body : FRD
+        Raw quaternion represents Body(FRD) -> World(NED)
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the UAV log file.
+
+    output_frame : str
+        "dji":
+            Return Body(FRD) -> World(NED)
+
+        "ros":
+            Return Body(FLU) -> World(ENU)
+
+    Returns
+    -------
+    data : list of dict
+        {
+            "ts": timestamp,
+            "rot": scipy Rotation object, body-to-world,
+            "R": 3x3 matrix, body-to-world
+        }
+    """
+    if output_frame not in ["dji", "ros"]:
+        raise ValueError("output_frame must be 'dji' or 'ros'.")
+
     data = []
-    with open(file_path, 'r') as f:
+
+    with open(file_path, "r") as f:
         content = f.read()
-    
-    # 使用正则表达式找到所有"receive quaternion data."之间的内容
-    pattern = r"receive quaternion data\.\s*\n(timestamp:\s+\d+\.\d+)\s*\n(quaternion:\s+[\d\.-]+\s+[\d\.-]+\s+[\d\.-]+\s+[\d\.-]+)"
+
+    pattern = (
+        r"receive quaternion data\.\s*\n"
+        r"(timestamp:\s+\d+\.\d+)\s*\n"
+        r"(quaternion:\s+"
+        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?\s+"
+        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?\s+"
+        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?\s+"
+        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?\.?)"
+    )
+
     matches = re.findall(pattern, content)
-    
-    # 处理时间戳对
-    last_efficient_timestamp = 0
-    for i in range(len(matches) - 1):  # 避免超出索引
-        # 解析第一个数据点
-        first_match = matches[i]
-        first_ts_str = first_match[0]
-        first_quat_str = first_match[1]
-        
+
+    last_efficient_timestamp = 0.0
+
+    # Body frame conversion: DJI FRD -> ROS FLU
+    C_frd_to_flu = np.array([
+        [1.0,  0.0,  0.0],
+        [0.0, -1.0,  0.0],
+        [0.0,  0.0, -1.0]
+    ])
+
+    # World frame conversion: ROS ENU -> DJI NED
+    C_enu_to_ned = np.array([
+        [0.0, 1.0,  0.0],
+        [1.0, 0.0,  0.0],
+        [0.0, 0.0, -1.0]
+    ])
+
+    for i in range(len(matches) - 1):
+        first_ts_str, first_quat_str = matches[i]
+        second_ts_str, _ = matches[i + 1]
+
         first_ts_match = re.search(r"timestamp:\s+(\d+\.\d+)", first_ts_str)
-        if not first_ts_match:
-            continue
-        first_ts = float(first_ts_match.group(1))
-        
-        first_quat_match = re.search(r"quaternion:\s+([\d\.-]+)\s+([\d\.-]+)\s+([\d\.-]+)\s+([\d\.-]+)\.", first_quat_str)
-        if not first_quat_match:
-            continue
-        
-        first_quat = [float(first_quat_match.group(2)), float(first_quat_match.group(3)), 
-                     float(first_quat_match.group(4)), float(first_quat_match.group(1))]
-        
-        # 解析第二个数据点
-        second_match = matches[i + 1]
-        second_ts_str = second_match[0]
-        
         second_ts_match = re.search(r"timestamp:\s+(\d+\.\d+)", second_ts_str)
-        if not second_ts_match:
+
+        if not first_ts_match or not second_ts_match:
             continue
+
+        first_ts = float(first_ts_match.group(1))
         second_ts = float(second_ts_match.group(1))
-        
-        # 检查条件：第二个时间戳比第一个大，且差值小于0.05
+
         time_diff = second_ts - first_ts
-        if time_diff > 0 and time_diff < 0.05 and first_ts > last_efficient_timestamp:
-            # 检查四元数是否有效并添加第一个数据点
-            if np.linalg.norm(first_quat) > 0:
-                rot = R.from_quat(first_quat)
-                data.append({'ts': first_ts, 'rot': rot})
-                last_efficient_timestamp  = first_ts
-        else:
-            # 不满足条件，继续处理后续数据
+
+        if not (time_diff > 0.0 and time_diff < 0.05):
             continue
-    
+
+        if first_ts <= last_efficient_timestamp:
+            continue
+
+        quat_match = re.search(
+            r"quaternion:\s+"
+            r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+            r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+            r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+            r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\.?",
+            first_quat_str
+        )
+
+        if not quat_match:
+            continue
+
+        # DJI order: w, x, y, z
+        q_w = float(quat_match.group(1))
+        q_x = float(quat_match.group(2))
+        q_y = float(quat_match.group(3))
+        q_z = float(quat_match.group(4))
+
+        # SciPy order: x, y, z, w
+        q_xyzw = np.array([q_x, q_y, q_z, q_w], dtype=np.float64)
+
+        q_norm = np.linalg.norm(q_xyzw)
+        if q_norm <= 1e-12:
+            continue
+
+        q_xyzw = q_xyzw / q_norm
+
+        # DJI raw rotation represents Body(FRD) -> World(NED)
+        rot_body_to_world_raw = R.from_quat(q_xyzw)
+        R_body_to_world_raw = rot_body_to_world_raw.as_matrix()
+
+        if not is_valid_rotation_matrix(R_body_to_world_raw):
+            continue
+
+        if output_frame == "dji":
+            R_body_to_world = R_body_to_world_raw
+            rot_body_to_world = rot_body_to_world_raw
+        else:
+            # Convert Body(FRD)->World(NED) to Body(FLU)->World(ENU)
+            # R_enu_flu = C_enu_ned.T @ R_ned_frd @ C_frd_flu.T
+            R_body_to_world = C_enu_to_ned.T @ R_body_to_world_raw @ C_frd_to_flu.T
+            rot_body_to_world = R.from_matrix(R_body_to_world)
+
+        if not is_valid_rotation_matrix(R_body_to_world):
+            continue
+
+        data.append({
+            "ts": first_ts,
+            "rot": rot_body_to_world,
+            "R": R_body_to_world
+        })
+
+        last_efficient_timestamp = first_ts
+
     return data
 
+
 def parse_iner_data(file_path):
-    """解析惯导数据: R^IMU_W_Body (Body to World)"""
+    """
+    Parse inertial data.
+    Output: Body(IMU) -> World(IMU world)
+    """
     data = []
-    prv_ts = 0
-    with open(file_path, 'r') as f:
+    previous_ts = 0.0
+
+    with open(file_path, "r") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith('#'):  # 跳过空行和注释
+
+            if not line or line.startswith("#"):
                 continue
-            parts = line.split(',')
-            if len(parts) < 13: 
+
+            parts = line.split(",")
+
+            if len(parts) < 13:
                 continue
+
             try:
                 ts = int(parts[1]) + int(parts[2]) / 1e9
 
-                if ts < prv_ts:
+                if ts < previous_ts:
                     continue
-                
-                prv_ts = ts
-                # 按照数据格式: num, time_stample_sec, time_stample_nsec, angle_rate.x, angle_rate.y, 
-                # angle_rate.z, accel.x, accel.y, accel.z, quaternion0, quaternion1, quaternion2, quaternion3
-                # 通常q0是标量部分w，q1,q2,q3是x,y,z向量部分
-                # scipy使用[x,y,z,w]格式，所以需要从[w,x,y,z]转换为[x,y,z,w]
-                quat_w = float(parts[9])   # q0
-                quat_x = float(parts[10])  # q1
-                quat_y = float(parts[11])  # q2
-                quat_z = float(parts[12])  # q3
-                
-                # 转换为scipy期望的格式 [x, y, z, w]
-                quat = [quat_x, quat_y, quat_z, quat_w]
-                
-                # 检查四元数是否有效
-                if np.linalg.norm(quat) > 0:
-                    rot = R.from_quat(quat)
-                    data.append({'ts': ts, 'rot': rot})
+
+                previous_ts = ts
+
+                quat_w = float(parts[9])
+                quat_x = float(parts[10])
+                quat_y = float(parts[11])
+                quat_z = float(parts[12])
+
+                q_xyzw = np.array([quat_x, quat_y, quat_z, quat_w], dtype=np.float64)
+
+                q_norm = np.linalg.norm(q_xyzw)
+                if q_norm <= 1e-12:
+                    continue
+
+                q_xyzw = q_xyzw / q_norm
+
+                rot_body_to_world = R.from_quat(q_xyzw)
+                R_body_to_world = rot_body_to_world.as_matrix()
+
+                if not is_valid_rotation_matrix(R_body_to_world):
+                    continue
+
+                data.append({
+                    "ts": ts,
+                    "rot": rot_body_to_world,
+                    "R": R_body_to_world
+                })
+
             except (ValueError, IndexError):
-                # 如果解析失败，跳过该行
                 continue
+
     return data
 
-def create_rotation_animation(uav_list, iner_list, estimated_delay, R_x=np.eye(3)):
-    # 最近邻插值对齐
-    iner_ts = np.array([d['ts'] for d in iner_list])
-    iner_rots = R.from_quat([d['rot'].as_quat() for d in iner_list])
-    slerp = Slerp(iner_ts, iner_rots)
-    
-    # 创建时间对齐的数据
-    aligned_uav_rots = []
-    aligned_iner_rots = []
-    common_ts = []
 
-    for uav_data in uav_list:
-        ts = uav_data['ts'] - estimated_delay
-        if iner_ts[0] <= ts <= iner_ts[-1]:
-            R_uav_in_w = uav_data['rot'].as_matrix()
-            R_body_in_c = slerp(ts).as_matrix()
-            #R_iner_in_uav = np.linalg.inv(R_uav_in_w) @ R_x @ R_body_in_c
-            #aligned_uav_rots.append(np.eye(3))
-            
-            R_iner_in_uav = R_x @ R_body_in_c
-            aligned_uav_rots.append(R_uav_in_w)
-            aligned_iner_rots.append(R_iner_in_uav)
-            common_ts.append(ts)
-            
-    # 定义坐标轴向量（单位向量）
-    axis_x = np.array([1, 0, 0])
-    axis_y = np.array([0, 1, 0])
-    axis_z = np.array([0, 0, 1])
-    
-    # 计算旋转后的坐标轴 - 现在使用矩阵乘法代替apply方法
-    uav_x_axes = [rot @ axis_x for rot in aligned_uav_rots]
-    uav_y_axes = [rot @ axis_y for rot in aligned_uav_rots]
-    uav_z_axes = [rot @ axis_z for rot in aligned_uav_rots]
-    
-    iner_x_axes = [rot @ axis_x for rot in aligned_iner_rots]
-    iner_y_axes = [rot @ axis_y for rot in aligned_iner_rots]
-    iner_z_axes = [rot @ axis_z for rot in aligned_iner_rots]
-
-    # 创建图形
-    fig = plt.figure(figsize=(12, 8))
-    
-    # 创建3D子图
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # 初始化函数
-    def init():
-        ax.set_xlim([-1.5, 1.5])
-        ax.set_ylim([-1.5, 1.5])
-        ax.set_zlim([-1.5, 1.5])
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title('UAV vs Inertial Rotation Comparison')
-        ax.grid(True)
-        
-        return []
-    
-    # 动画更新函数
-    def update(frame):
-        # 清除之前的绘图
-        ax.clear()
-        
-        # 设置坐标轴范围和标签
-        ax.set_xlim([-1.5, 1.5])
-        ax.set_ylim([-1.5, 1.5])
-        ax.set_zlim([-1.5, 1.5])
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title(f'UAV vs Inertial Rotation (Frame {frame})')
-        ax.grid(True)
-        
-        # 添加时间戳文本
-        if frame < len(common_ts):
-            timestamp_text = f'Time: {common_ts[frame]:.3f}s'
-            ax.text2D(0.02, 0.95, timestamp_text, transform=ax.transAxes, fontsize=10, 
-                      verticalalignment='top', bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
-        
-        # 绘制UAV坐标轴
-        if frame < len(uav_x_axes):
-            origin = np.array([0, 0, 0])
-            # 绘制UAV的X轴（红色，较细）
-            ax.quiver(*origin, *uav_x_axes[frame], color='red', alpha=1.0, arrow_length_ratio=0.1, linewidths=2)
-            # 绘制UAV的Y轴（绿色，较细）
-            ax.quiver(*origin, *uav_y_axes[frame], color='green', alpha=1.0, arrow_length_ratio=0.1, linewidths=2)
-            # 绘制UAV的Z轴（蓝色，较细）
-            ax.quiver(*origin, *uav_z_axes[frame], color='blue', alpha=1.0, arrow_length_ratio=0.1, linewidths=2)
-            
-            # 添加UAV轴标签
-            ax.text(uav_x_axes[frame][0], uav_x_axes[frame][1], uav_x_axes[frame][2], 'UAV-X', color='red', fontsize=10)
-            ax.text(uav_y_axes[frame][0], uav_y_axes[frame][1], uav_y_axes[frame][2], 'UAV-Y', color='green', fontsize=10)
-            ax.text(uav_z_axes[frame][0], uav_z_axes[frame][1], uav_z_axes[frame][2], 'UAV-Z', color='blue', fontsize=10)
-        
-        # 绘制惯导坐标轴
-        if frame < len(iner_x_axes):
-            origin = np.array([0, 0, 0])
-            # 绘制惯导的X轴（青色，较粗）
-            ax.quiver(*origin, *iner_x_axes[frame], color='cyan', alpha=1.0, arrow_length_ratio=0.1, linewidths=4)
-            # 绘制惯导的Y轴（黄色，较粗）
-            ax.quiver(*origin, *iner_y_axes[frame], color='yellow', alpha=1.0, arrow_length_ratio=0.1, linewidths=4)
-            # 绘制惯导的Z轴（洋红色，较粗）
-            ax.quiver(*origin, *iner_z_axes[frame], color='magenta', alpha=1.0, arrow_length_ratio=0.1, linewidths=4)
-            
-            # 添加惯导轴标签
-            ax.text(iner_x_axes[frame][0], iner_x_axes[frame][1], iner_x_axes[frame][2], 'IN-X', color='cyan', fontsize=10)
-            ax.text(iner_y_axes[frame][0], iner_y_axes[frame][1], iner_y_axes[frame][2], 'IN-Y', color='yellow', fontsize=10)
-            ax.text(iner_z_axes[frame][0], iner_z_axes[frame][1], iner_z_axes[frame][2], 'IN-Z', color='magenta', fontsize=10)
-        
-        return []
-    
-    # 创建动画
-    ani = FuncAnimation(fig, update, frames=min(len(aligned_uav_rots), len(aligned_iner_rots)), 
-                        init_func=init, blit=False, interval=50, repeat=True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    try:
-        # 尝试使用plt.waitforbuttonpress()等待用户交互
-        print("动画正在显示，按任意键或关闭窗口以退出...")
-        plt.waitforbuttonpress()
-    except:
-        # 如果waitforbuttonpress不可用，使用input()阻塞
-        input("按Enter键退出...")
-        
-    return ani
-
-def estimate_time_delay(uav_list, iner_list, max_delay_seconds=1.0, sample_rate_guess=200):
+def estimate_time_delay(uav_list, iner_list, max_delay_seconds=1.0, sample_rate_guess=500):
     """
-    鲁棒的两个旋转系统时延估计函数
+    Estimate time delay between UAV and IMU attitude sequences.
     """
-    # --- 1. 提取时间戳和旋转 ---
-    def clean_data(data_list):
-        ts = np.array([d['ts'] for d in data_list])
-        rots = [d['rot'] for d in data_list]
-        
-        return ts, rots
+    uav_ts = np.array([d["ts"] for d in uav_list], dtype=np.float64)
+    iner_ts = np.array([d["ts"] for d in iner_list], dtype=np.float64)
 
-    uav_ts, uav_rots = clean_data(uav_list)
-    iner_ts, iner_rots = clean_data(iner_list)
+    uav_rots = R.from_quat([d["rot"].as_quat() for d in uav_list])
+    iner_rots = R.from_quat([d["rot"].as_quat() for d in iner_list])
 
-    # --- 2. 确定公共时间窗口 ---
-    # 为了避免边界效应，我们在重叠区域两头各缩减一点时间
     overlap_start = max(uav_ts[0], iner_ts[0]) + 0.2
     overlap_end = min(uav_ts[-1], iner_ts[-1]) - 0.2
 
     if overlap_end - overlap_start < 2.0:
-        print("错误: 重叠时间太短，无法可靠估计时延。")
+        print("Error: overlapping time range is too short.")
         return 0.0, 0.0
 
-    print(f"分析时间窗口: {overlap_end - overlap_start:.2f} 秒")
+    print(f"Analysis time window: {overlap_end - overlap_start:.2f} s")
 
-    # --- 3. 统一重采样 (Resampling) ---
     dt = 1.0 / sample_rate_guess
     common_time = np.arange(overlap_start, overlap_end, dt)
 
-    # 构建插值器
-    # 注意：SciPy 的 Slerp 需要旋转对象
-    uav_slerp = Slerp(uav_ts, R.from_quat([r.as_quat() for r in uav_rots]))
-    iner_slerp = Slerp(iner_ts, R.from_quat([r.as_quat() for r in iner_rots]))
+    uav_slerp = Slerp(uav_ts, uav_rots)
+    iner_slerp = Slerp(iner_ts, iner_rots)
 
-      # 插值得到对齐后的旋转（现在时间轴是均匀的）
-    uav_rots_interp = uav_slerp(common_time)
-    iner_rots_interp = iner_slerp(common_time)
+    uav_interp = uav_slerp(common_time)
+    iner_interp = iner_slerp(common_time)
 
-    # --- 4. 改进的角速度计算（使用中心差分） ---
-    def get_angular_speed_magnitude_centered(rots, time_array):
-        """
-        使用中心差分计算角速度，更平滑
-        """
+    def angular_speed_magnitude(rots, time_array):
         speeds = []
-        for i in range(1, len(rots)-1):
-            r_prev = rots[i-1]
-            r_curr = rots[i]
-            r_next = rots[i+1]
-            
-            # 使用中心差分：R_diff = R_{i-1}^{-1} * R_{i+1}
-            # 这对应的时间跨度是 t_{i+1} - t_{i-1}
+        for i in range(1, len(rots) - 1):
+            r_prev = rots[i - 1]
+            r_next = rots[i + 1]
             r_diff = r_prev.inv() * r_next
             angle = r_diff.magnitude()
-            
-            # 时间跨度（中心差分的时间间隔是2*dt）
-            dt_span = time_array[i+1] - time_array[i-1]
-            
-            if dt_span > 0:
-                speed = angle / dt_span
-            else:
-                speed = 0.0
-            
-            speeds.append(speed)
-        
-        # 在两端补值（使用相邻值）
+            dt_span = time_array[i + 1] - time_array[i - 1]
+            speeds.append(angle / dt_span if dt_span > 0 else 0.0)
+
         if len(speeds) > 0:
             speeds = [speeds[0]] + speeds + [speeds[-1]]
         else:
             speeds = [0.0] * len(rots)
-        
         return np.array(speeds)
 
-    # 使用中心差分计算角速度
-    uav_speed = get_angular_speed_magnitude_centered(uav_rots_interp, common_time)
-    iner_speed = get_angular_speed_magnitude_centered(iner_rots_interp, common_time)
+    uav_speed = angular_speed_magnitude(uav_interp, common_time)
+    iner_speed = angular_speed_magnitude(iner_interp, common_time)
 
-    # --- 5. 低通滤波 ---
-    # 使用Savitzky-Golay滤波器，既能平滑又能保持信号特征
-    from scipy.signal import savgol_filter
-    
-    # 窗口大小应根据采样率调整，一般取奇数
-    window_length = min(11, len(uav_speed) - 1)  # 确保窗口长度小于数据长度
-    if window_length % 2 == 0:  # 确保窗口长度为奇数
+    window_length = min(11, len(uav_speed) - 1)
+    if window_length % 2 == 0:
         window_length -= 1
-    if window_length < 3:
-        window_length = 3
-        
-    polyorder = 3  # 多项式阶数
-    
-    if len(uav_speed) > window_length and len(iner_speed) > window_length:
+
+    if window_length >= 5:
+        polyorder = min(3, window_length - 1)
         uav_speed_smooth = savgol_filter(uav_speed, window_length, polyorder)
         iner_speed_smooth = savgol_filter(iner_speed, window_length, polyorder)
     else:
-        # 如果数据太短，使用高斯滤波
         uav_speed_smooth = gaussian_filter1d(uav_speed, sigma=2)
         iner_speed_smooth = gaussian_filter1d(iner_speed, sigma=2)
 
-    # --- 6. 归一化 ---
     def normalize(v):
         return (v - np.mean(v)) / (np.std(v) + 1e-10)
 
     uav_norm = normalize(uav_speed_smooth)
     iner_norm = normalize(iner_speed_smooth)
 
-    # --- 7. 互相关分析 ---
-    correlation = correlate(uav_norm, iner_norm, mode='full')
+    correlation = correlate(uav_norm, iner_norm, mode="full")
     lags = np.arange(-len(iner_norm) + 1, len(uav_norm))
-    
-    # 转换为时间偏移
     time_lags = lags * dt
 
-    # 限制搜索范围
     valid_mask = (time_lags >= -max_delay_seconds) & (time_lags <= max_delay_seconds)
+
     if not np.any(valid_mask):
-         print("警告: 指定的最大时延范围内没有数据点")
-         return 0.0, 0.0
-         
+        print("Warning: no valid lag in the specified delay range.")
+        return 0.0, 0.0
+
     valid_lags = time_lags[valid_mask]
     valid_corr = correlation[valid_mask]
 
-    # 找到最大值
     max_idx = np.argmax(valid_corr)
     estimated_delay = valid_lags[max_idx]
     max_corr_val = valid_corr[max_idx]
 
-    print(f"估计时延: {estimated_delay:.4f} s (相关系数: {max_corr_val:.4f})")
-    print(f"解释: 如果值为正 (例如 0.1s)，意味着 UAV 信号波形出现在 Inertial 之后 0.1s。")
-    print(f"      即 Inertial 的时间戳比 UAV 早。为对齐，需将 Inertial 时间戳 +0.1s。")
+    print(f"Estimated delay: {estimated_delay:.4f} s")
+    print(f"Correlation score: {max_corr_val:.4f}")
 
-    # --- 可视化验证 ---
-    # import matplotlib.pyplot as plt
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
-    plt.plot(uav_speed, label='UAV Angular Velocity')
-    plt.plot(iner_speed, label='Iner Angular Velocity')
+    plt.plot(common_time, uav_speed_smooth, label="UAV angular speed")
+    plt.plot(common_time, iner_speed_smooth, label="IMU angular speed")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Angular speed (rad/s)")
+    plt.title("Angular speed comparison")
     plt.legend()
-    plt.title('Angular Velocity Comparison')
-    
+
     plt.subplot(1, 2, 2)
     plt.plot(valid_lags, valid_corr)
-    plt.axvline(x=estimated_delay, color='r', linestyle='--', label=f'Delay: {estimated_delay:.4f}s')
-    plt.xlabel('Time Lag (s)')
-    plt.ylabel('Cross-correlation')
-    plt.title('Cross-correlation vs Time Lag')
+    plt.axvline(x=estimated_delay, color="r", linestyle="--", label=f"Delay: {estimated_delay:.4f} s")
+    plt.xlabel("Time lag (s)")
+    plt.ylabel("Cross-correlation")
+    plt.title("Cross-correlation")
     plt.legend()
     plt.tight_layout()
     plt.show()
 
     return estimated_delay, max_corr_val
 
-def solve_hand_eye(uav_list,iner_list,estimated_delay):
-    # 插值对齐
-    iner_ts = np.array([d['ts'] for d in iner_list])
-    iner_rots = R.from_quat([d['rot'].as_quat() for d in iner_list])
+
+def solve_hand_eye(uav_list, iner_list, estimated_delay, step=10):
+    """
+    Solve UAV-IMU rotation extrinsic using OpenCV calibrateHandEye.
+    
+    Returns
+    -------
+    dict or None:
+        包含外参 R_uav_imu 和 世界系对齐矩阵 R_imuworld_to_uavworld 的字典。
+    """
+    iner_ts = np.array([d["ts"] for d in iner_list], dtype=np.float64)
+
+    sort_idx = np.argsort(iner_ts)
+    iner_ts = iner_ts[sort_idx]
+    iner_quats = [iner_list[i]["rot"].as_quat() for i in sort_idx]
+    iner_rots = R.from_quat(iner_quats)
+
+    unique_ts, unique_idx = np.unique(iner_ts, return_index=True)
+    iner_ts = unique_ts
+    iner_rots = R.from_quat(iner_rots.as_quat()[unique_idx])
+
+    if len(iner_ts) < 2:
+        print("Insufficient IMU data for interpolation.")
+        return None
+
+    slerp = Slerp(iner_ts, iner_rots)
+    raw_pairs = []
+
+    for i in range(0, len(uav_list), step):
+        t_uav = uav_list[i]["ts"]
+        t_imu = t_uav - estimated_delay
+
+        if not (iner_ts[0] <= t_imu <= iner_ts[-1]):
+            continue
+
+        R_uav_raw = uav_list[i]["rot"].as_matrix()     # R_world_uav
+        R_imu_raw = slerp(t_imu).as_matrix()           # R_imuworld_imu
+
+        raw_pairs.append((R_uav_raw, R_imu_raw, t_uav, t_imu))
+
+    if len(raw_pairs) < 5:
+        print("Insufficient overlapping data.")
+        return None
+
+    zero_T = [np.zeros((3, 1), dtype=np.float64) for _ in raw_pairs]
+    
+    best = None
+    R_gripper2base = []
+    R_target2cam = []
+    used_pairs = []
+
+    for R_uav_raw, R_imu_raw, t_uav, t_imu in raw_pairs:
+        R_world_uav = R_uav_raw
+        R_imu_imuworld = R_imu_raw.T
+        R_gripper2base.append(R_world_uav)
+        R_target2cam.append(R_imu_imuworld)
+        used_pairs.append((R_world_uav, R_imu_imuworld))
+
+    methods = [
+        cv2.CALIB_HAND_EYE_PARK,
+        cv2.CALIB_HAND_EYE_TSAI,
+        cv2.CALIB_HAND_EYE_HORAUD,
+    ]
+    
+    for method in methods:
+        try:
+            R_x, _ = cv2.calibrateHandEye(
+                R_gripper2base, zero_T, R_target2cam, zero_T, method=method
+            )
+        except cv2.error as e:
+            print(f"Method {method} failed:\n{e}")
+            continue
+
+        world_align_list = []
+        for R_world_uav, R_imu_imuworld in used_pairs:
+            R_world_imuworld = R_world_uav @ R_x @ R_imu_imuworld
+            world_align_list.append(R_world_imuworld)
+
+        R_mean = R.from_matrix(np.stack(world_align_list)).mean().as_matrix()
+
+        residuals = []
+        for R_world_imuworld in world_align_list:
+            delta = R_mean.T @ R_world_imuworld
+            angle_deg = np.degrees(R.from_matrix(delta).magnitude())
+            residuals.append(angle_deg)
+
+        residuals = np.array(residuals)
+        mean_err = float(np.mean(residuals))
+        std_err = float(np.std(residuals))
+        median_err = float(np.median(residuals))
+        max_err = float(np.max(residuals))
+
+        score = (median_err, mean_err, std_err)
+
+        if best is None or score < best["score"]:
+            best = {
+                "score": score,
+                "method": method,
+                "R_x": R_x,
+                "R_mean": R_mean,  # 保存对齐矩阵
+                "mean": mean_err,
+                "std": std_err,
+                "median": median_err,
+                "max": max_err,
+            }
+
+    if best is None:
+        print("Hand-eye calibration failed for all cases.")
+        return None
+
+    print("\n==================== BEST RESULT ====================")
+    print(f"Best method: {best['method']}")
+    print("Best R_x = R^uav_imu:\n", best["R_x"])
+    print("Best R_imuworld_to_uavworld:\n", best["R_mean"])
+    print(f"Best residual mean  : {best['mean']:.4f} deg")
+    print(f"Best residual median: {best['median']:.4f} deg")
+
+    # 保存至文件
+    fs = cv2.FileStorage("extrinsic.xml", cv2.FILE_STORAGE_WRITE)
+    fs.write("R_imu_to_uav", best["R_x"])
+    fs.write("R_imuworld_to_uavworld", best["R_mean"])
+    fs.write("method", int(best["method"]))
+    fs.write("residual_mean_deg", best["mean"])
+    fs.release()
+
+    return {
+        "R_uav_imu": best["R_x"],
+        "R_imuworld_to_uavworld": best["R_mean"]
+    }
+
+
+def create_rotation_animation(uav_list, iner_list, estimated_delay, calib_result, anim_step=5):
+    """
+    完善后的三维动画可视化：验证外参解算一致性。
+    
+    通过动态绘制 IMU 机体系在 UAV 世界坐标系下的两个三维姿态轴线：
+    1. 预测轴（红绿蓝细线）：由 UAV 姿态和解算出的外参矩阵计算得到： R_pred = R_world_uav @ R_uav_imu
+    2. 测量轴（青黄品粗线）：由 IMU 原始姿态和世界系对齐矩阵计算得到： R_meas = R_imuworld_to_uavworld @ R_imu_raw
+    """
+    R_uav_imu = calib_result["R_uav_imu"]
+    R_imuworld_to_uavworld = calib_result["R_imuworld_to_uavworld"]
+
+    iner_ts = np.array([d["ts"] for d in iner_list], dtype=np.float64)
+    sort_idx = np.argsort(iner_ts)
+    iner_ts = iner_ts[sort_idx]
+    iner_quats = [iner_list[i]["rot"].as_quat() for i in sort_idx]
+    iner_rots = R.from_quat(iner_quats)
+
+    unique_ts, unique_idx = np.unique(iner_ts, return_index=True)
+    iner_ts = unique_ts
+    iner_rots = R.from_quat(iner_rots.as_quat()[unique_idx])
+
     slerp = Slerp(iner_ts, iner_rots)
 
-    R_A, R_B = [], []
-    index_list = []
-    step = 10 # 增加步长以获得明显的旋转量，提高标定鲁棒性
+    predicted_imu_axes = []
+    measured_imu_axes = []
+    common_ts = []
 
-    for i in range(0, len(uav_list) - step, step):
-        t1, t2 = uav_list[i]['ts'], uav_list[i+step]['ts']
+    # 引入 anim_step 降采样，防止高频数据导致动画卡死
+    for i in range(0, len(uav_list), anim_step):
+        uav_data = uav_list[i]
+        t_uav = uav_data["ts"]
+        t_imu = t_uav - estimated_delay
+
+        if not (iner_ts[0] <= t_imu <= iner_ts[-1]):
+            continue
+
+        R_world_uav = uav_data["rot"].as_matrix()
+        R_imu_raw = slerp(t_imu).as_matrix()  # Body(IMU) -> World(IMU)
+
+        # 1. 从无人机姿态通过外参预测 IMU 姿态
+        R_pred = R_world_uav @ R_uav_imu
+        # 2. 从 IMU 姿态通过世界系统一转换为无人机世界下的姿态
+        R_meas = R_imuworld_to_uavworld @ R_imu_raw
+
+        predicted_imu_axes.append(R_pred)
+        measured_imu_axes.append(R_meas)
+        common_ts.append(t_uav)
+
+    if len(predicted_imu_axes) == 0:
+        print("No overlapping data for animation.")
+        return None
+
+    # 定义标准直角坐标轴基向量
+    axis_x = np.array([1.0, 0.0, 0.0])
+    axis_y = np.array([0.0, 1.0, 0.0])
+    axis_z = np.array([0.0, 0.0, 1.0])
+
+    # 提取序列中每一帧的三维基向量方向
+    pred_x = [rot @ axis_x for rot in predicted_imu_axes]
+    pred_y = [rot @ axis_y for rot in predicted_imu_axes]
+    pred_z = [rot @ axis_z for rot in predicted_imu_axes]
+
+    meas_x = [rot @ axis_x for rot in measured_imu_axes]
+    meas_y = [rot @ axis_y for rot in measured_imu_axes]
+    meas_z = [rot @ axis_z for rot in measured_imu_axes]
+
+    # 初始化 3D 画布
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    def set_axes_properties():
+        ax.set_xlim([-1.2, 1.2])
+        ax.set_ylim([-1.2, 1.2])
+        ax.set_zlim([-1.2, 1.2])
+        ax.set_xlabel("X (World)")
+        ax.set_ylabel("Y (World)")
+        ax.set_zlabel("Z (World)")
+        ax.grid(True)
+
+    # 创建虚假的隐藏线条用以生成标准的图例 Legend
+    dummy_pred = ax.plot([0], [0], [0], color="red", linestyle="-", linewidth=1.5, label="Predicted IMU Frame (from UAV + Extrinsic)")[0]
+    dummy_meas = ax.plot([0], [0], [0], color="cyan", linestyle="-", linewidth=3, label="Measured IMU Frame (from IMU + World Align)")[0]
+    ax.legend(handles=[dummy_pred, dummy_meas], loc="upper left")
+
+    def init():
+        set_axes_properties()
+        return []
+
+    def update(frame):
+        # 彻底清空画布重绘三维向量，保证箭头更新稳定
+        ax.clear()
+        set_axes_properties()
         
-        if iner_ts[0] <= t1 and t2 <= iner_ts[-1]:
-            index_list.append(i)
-            
-            # R_UAV^W
-            R_uav1_in_w = uav_list[i]['rot']
-            R_uav2_in_w = uav_list[i+step]['rot']
-            
-            # R_IMU_W^Body
-            R_imu1_in_c = slerp(t1 - estimated_delay)
-            R_imu2_in_c = slerp(t2 - estimated_delay)
-                      
-            # 根据推导: A = R^w_uav2 * R^uav1_w
-            # R^uav1_w =  (R_uav1_in_w)-1 
-            mat_A = (R_uav2_in_w * R_uav1_in_w.inv()).as_matrix()
-
-            # 根据推导: B = (R^c_body2) * R^body1_c
-            #  R^body1_c =  (R_imu1_in_c)-1
-            mat_B = (R_imu2_in_c * R_imu1_in_c.inv()).as_matrix()
-
-            R_A.append(mat_A)
-            R_B.append(mat_B)
-            
-           # 提取旋转向量 (Axis * Angle)
-            vec_A = R.from_matrix(mat_A).as_rotvec()
-            vec_B = R.from_matrix(mat_B).as_rotvec()
-
-            # 计算旋转向量的模长（角度）
-            angle_A = np.linalg.norm(vec_A)
-            angle_B = np.linalg.norm(vec_B)
-
-            # 计算 A 和 B 旋转轴的夹角余弦值
-            # 注意：虽然 A 和 B 在不同坐标系，但 AX=XB 意味着它们描述的是同一个物理旋转
-            # 它们的点积在整个序列中应该保持一个相对稳定的值（因为 Rx 是固定的）
-            cos_sim = np.dot(vec_A, vec_B) / (angle_A * angle_B)
-
-            print(f"Angle A: {angle_A:.6f}, Angle B: {angle_B:.6f}, Dot: {cos_sim:.6f}")
- 
-    if len(R_A) < 5:
-        print("Insufficient overlapping data.")
-        return
-
-    # 构造零平移向量
-    zero_T = [np.zeros((3, 1)) for _ in R_A]
-
-        # 验证: 取一组数据看结果是否为常数矩阵
-    method_list = [cv2.CALIB_HAND_EYE_TSAI, cv2.CALIB_HAND_EYE_PARK]
-                  
-
-    # 使用 Park-Martin 算法求解 AX=XB, X = R^w_c
-    rotation_std = []
-    results = []
-    
-    for method in method_list:
-        R_x, _ = cv2.calibrateHandEye(R_A, zero_T, R_B, zero_T, method=method)
-        print(f"Method: {method}, X:\n", R_x, "R_x det: ", np.linalg.det(R_x))
-  
-        rotation_angles = []
-        for idx in index_list:
-            R_uav_in_w = uav_list[idx]['rot'].as_matrix()
-            R_body_in_c = slerp(uav_list[idx]['ts']-estimated_delay).as_matrix()
-            R_const = np.linalg.inv(R_uav_in_w) @ R_x @ R_body_in_c
-            
-            trace = np.trace(R_const)
-            angle_rad = np.arccos(np.clip((trace - 1) / 2, -1, 1))  # 限制在[-1,1]范围内
-            angle_deg = np.degrees(angle_rad)
-            rotation_angles.append(angle_deg)
-            
-        if rotation_angles:
-            mean_angle = np.mean(rotation_angles)
-            std_angle = np.std(rotation_angles)
-            var_angle = np.var(rotation_angles)
-            rotation_std.append(std_angle)
-            
-            print(f"\nRotation Angles Statistics:")
-            print(f"Mean: {mean_angle:.4f} degrees")
-            print(f"Standard Deviation: {std_angle:.4f} degrees")
-            print(f"Variance: {var_angle:.4f} degrees²")
-            print(f"Max: {np.max(rotation_angles):.4f} degrees")
-            print(f"Min: {np.min(rotation_angles):.4f} degrees")
-            
-            results.append((method, R_x, std_angle))
-    
-    # 选择方差最小的方法
-    if results:
-        best_method_idx = np.argmin(rotation_std)
-        best_method, best_R_x, best_std = results[best_method_idx]
+        # 重新补上图例
+        ax.legend(handles=[dummy_pred, dummy_meas], loc="upper left")
+        ax.set_title(
+            f"IMU Frame Consistency Verification [Frame {frame}/{len(predicted_imu_axes)-1}]", 
+            y=0, 
+            fontsize=12, 
+            weight="bold"
+        )
         
-        print(f"\nBest method: {best_method} with std: {best_std:.4f}")
-        print(f"Best rotation matrix:\n{best_R_x}")
-        
-        # 更新R_x为最佳结果
-        R_x = best_R_x
-        
-    # 保存 XML
-    fs = cv2.FileStorage("extrinsic.xml", cv2.FILE_STORAGE_WRITE)
-    fs.write("R_imu_to_uav", R_x)
-    fs.release()
-    
-    return R_x
+        # 打印当前帧对应的时间戳
+        ax.text2D(0.02, 0.90, f"Time: {common_ts[frame]:.3f} s", transform=ax.transAxes, fontsize=11, weight="bold")
+
+        origin = np.array([0.0, 0.0, 0.0])
+
+        # 1. 绘制预测的 IMU 坐标轴（细线：红、绿、蓝）
+        ax.quiver(*origin, *pred_x[frame], color="red", alpha=0.9, arrow_length_ratio=0.12, linewidths=1.5)
+        ax.quiver(*origin, *pred_y[frame], color="green", alpha=0.9, arrow_length_ratio=0.12, linewidths=1.5)
+        ax.quiver(*origin, *pred_z[frame], color="blue", alpha=0.9, arrow_length_ratio=0.12, linewidths=1.5)
+
+        # 2. 绘制实际测量的 IMU 坐标轴（粗线半透明包裹：青、黄、品红）
+        ax.quiver(*origin, *meas_x[frame], color="cyan", alpha=0.5, arrow_length_ratio=0.1, linewidths=4)
+        ax.quiver(*origin, *meas_y[frame], color="yellow", alpha=0.5, arrow_length_ratio=0.1, linewidths=4)
+        ax.quiver(*origin, *meas_z[frame], color="magenta", alpha=0.5, arrow_length_ratio=0.1, linewidths=4)
+
+        # 动态添加轴向文字标签
+        ax.text(*(pred_x[frame]*1.1), "X", color="red", fontsize=10, weight="bold")
+        ax.text(*(pred_y[frame]*1.1), "Y", color="green", fontsize=10, weight="bold")
+        ax.text(*(pred_z[frame]*1.1), "Z", color="blue", fontsize=10, weight="bold")
+
+        return []
+
+    ani = FuncAnimation(
+        fig,
+        update,
+        frames=len(predicted_imu_axes),
+        init_func=init,
+        blit=False,
+        interval=40,  # 约 25 帧/秒 
+        repeat=True
+    )
+
+    plt.tight_layout()
+    plt.show()
+    return ani
+
 
 if __name__ == "__main__":
-    uav_list = parse_uav_data('../save_data/navigation_log.txt')
-    iner_list = parse_iner_data('../save_data/inertial_data/inertial_data.txt')
-    estimated_delay, _ = estimate_time_delay(uav_list, iner_list)
-    
-    #create_rotation_animation(uav_list,iner_list,estimated_delay)
-    R_x = solve_hand_eye(uav_list,iner_list,estimated_delay) #R_x : R^uav_imu 或者说imu坐标系在uav坐标系下的姿态
-    
-    create_rotation_animation(uav_list,iner_list,estimated_delay,R_x)
+    # 解析无人机数据
+    uav_list = parse_uav_data(
+        "../../save_data/navigation_log.txt",
+        output_frame="dji"
+    )
+
+    # 解析惯导数据
+    iner_list = parse_iner_data(
+        "../../save_data/inertial_data/inertial_data.txt"
+    )
+
+    # 延迟估计
+    estimated_delay, _ = estimate_time_delay(
+        uav_list,
+        iner_list,
+        max_delay_seconds=1.0,
+        sample_rate_guess=500
+    )
+
+    # 手眼标定解算
+    calib_result = solve_hand_eye(
+        uav_list,
+        iner_list,
+        estimated_delay,
+        step=10
+    )
+
+    # 动画一致性验证
+    if calib_result is not None:
+        ani = create_rotation_animation(
+            uav_list,
+            iner_list,
+            estimated_delay,
+            calib_result,
+            anim_step=5  # 每隔 5 帧画一次，保证流畅度
+        )
